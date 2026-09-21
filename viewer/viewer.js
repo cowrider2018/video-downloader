@@ -112,7 +112,51 @@ function fileButton(m) {
   };
 }
 
+// MSE captures are saved by the page itself, so there is no download id to track; the
+// button just acknowledges for a moment (the capture may keep growing and can be saved again).
+const mseSavedAt = new Map();
+
+function mseExt(mime) {
+  const type = mime.split(';')[0].trim();
+  if (type === 'audio/mp4') return 'm4a';
+  if (type === 'audio/webm') return 'weba';
+  if (type.endsWith('/webm')) return 'webm';
+  return 'mp4';
+}
+
+function mseRow(m) {
+  const audio = m.mime.startsWith('audio/');
+  const codec = m.mime.match(/codecs="?([^",]+)/)?.[1] || m.mime.split(';')[0];
+  const label = audio ? '音訊' : '影像';
+  const saved = Date.now() - (mseSavedAt.get(m.url) || 0) < 3000;
+  return {
+    key: m.url,
+    name: `緩存${label} (${codec})`,
+    title: m.mime,
+    meta: ['MSE', formatBytes(m.size), m.truncated ? '已達上限' : ''],
+    button: saved
+      ? { text: '已存', disabled: true }
+      : {
+          text: '下載',
+          disabled: !m.size,
+          onClick: () => {
+            send({
+              type: 'save-mse',
+              tabId: trackedId,
+              frameId: m.frameId,
+              streamId: m.streamId,
+              filename: filenameFor(titleForFiles(), mseExt(m.mime), label),
+            });
+            mseSavedAt.set(m.url, Date.now());
+            render();
+            setTimeout(render, 3000);
+          },
+        },
+  };
+}
+
 function rowsFor(m) {
+  if (m.kind === 'mse') return [mseRow(m)];
   const name = displayName(m.url);
   if (m.kind === 'file') {
     return [{ key: m.url, name, title: m.url, meta: [m.ext.toUpperCase(), formatBytes(m.size)], button: fileButton(m) }];
@@ -207,6 +251,8 @@ async function follow(tabId) {
 }
 
 // ---- Startup --------------------------------------------------------------------------
+
+await send({ type: 'capture-on' });
 
 // Listen before the first read so nothing that changes in between is missed.
 chrome.storage.session.onChanged.addListener((changes) => {

@@ -34,4 +34,29 @@
   );
 
   scan();
+
+  // Bridge to inject/mse-hook.js, which lives in the page's world and can't reach the
+  // extension itself.
+  const TAG = '__vd_mse__';
+  const send = (msg) => {
+    try {
+      chrome.runtime.sendMessage(msg).catch(() => {});
+    } catch {
+      // Extension was reloaded.
+    }
+  };
+
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || !e.data || typeof e.data !== 'object') return;
+    if (e.data[TAG] === 'streams' && Array.isArray(e.data.streams)) {
+      send({ type: 'mse-streams', streams: e.data.streams });
+    }
+  });
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'mse-save') window.postMessage({ [TAG]: 'save', id: msg.id, filename: msg.filename }, '*');
+  });
+
+  // The hook may have announced streams before this script started listening.
+  window.postMessage({ [TAG]: 'hello' }, '*');
 })();

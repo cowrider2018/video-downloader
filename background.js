@@ -45,8 +45,10 @@ async function addMedia(tabId, item) {
       added = { id: crypto.randomUUID(), detectedAt: Date.now(), ...item };
       return linkChildren([...list, added]);
     }
-    if (old.size == null && item.size != null) {
-      return list.map((m) => (m === old ? { ...m, size: item.size } : m));
+    // MSE captures keep growing while the video plays.
+    const grew = item.kind === 'mse' ? old.size !== item.size || old.truncated !== item.truncated : false;
+    if (grew || (old.size == null && item.size != null)) {
+      return list.map((m) => (m === old ? { ...m, size: item.size, truncated: item.truncated } : m));
     }
   });
   if (added?.kind === 'hls') probe(tabId, added);
@@ -78,6 +80,29 @@ async function trackActiveIn(windowId) {
   const active = win.tabs.find((t) => t.active);
   // Never follow the extension's own pages (e.g. the viewer opened as a normal tab).
   if (active && !active.url?.startsWith(chrome.runtime.getURL(''))) track(active.id);
+}
+
+// MSE capture hook: registered only while a viewer window exists, since it keeps a copy of
+// everything a player buffers. Pages loaded before that are not captured.
+const HOOK_ID = 'vd-mse-hook';
+
+async function setCapture(on) {
+  const registered = await chrome.scripting.getRegisteredContentScripts({ ids: [HOOK_ID] });
+  if (on && !registered.length) {
+    await chrome.scripting.registerContentScripts([
+      {
+        id: HOOK_ID,
+        matches: ['http://*/*', 'https://*/*'],
+        js: ['inject/mse-hook.js'],
+        runAt: 'document_start',
+        world: 'MAIN',
+        allFrames: true,
+        persistAcrossSessions: false,
+      },
+    ]);
+  } else if (!on && registered.length) {
+    await chrome.scripting.unregisterContentScripts({ ids: [HOOK_ID] });
+  }
 }
 
 async function openViewer(tab) {
@@ -275,9 +300,10 @@ chrome.webNavigation.onCommitted.addListener((d) => {
 chrome.tabs.onActivated.addListener(({ windowId }) => trackActiveIn(windowId));
 chrome.windows.onFocusChanged.addListener(trackActiveIn);
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
   chrome.storage.session.remove(tabKey(tabId));
   chains.delete(tabKey(tabId));
+  if (!(await viewerContext())) setCapture(false).catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -293,6 +319,30 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       }
       return;
     }
+    case 'mse-streams': {
+      const tabId = sender.tab?.id;
+      if (tabId == null) return;
+      for (const st of msg.streams) {
+        addMedia(tabId, {
+          url: `mse:${sender.frameId}:${st.id}`,
+          kind: 'mse',
+          mime: String(st.mime),
+          size: Number(st.bytes) || 0,
+          truncated: !!st.truncated,
+          frameId: sender.frameId,
+          streamId: st.id,
+        });
+      }
+      return;
+    }
+    case 'save-mse':
+      chrome.tabs
+        .sendMessage(msg.tabId, { type: 'mse-save', id: msg.streamId, filename: msg.filename }, { frameId: msg.frameId })
+        .catch(() => {});
+      return;
+    case 'capture-on':
+      setCapture(true).then(() => reply(true), (e) => reply({ error: e.message }));
+      return true;
     case 'download':
       chrome.downloads
         .download({ url: msg.url, filename: msg.filename, conflictAction: 'uniquify' })

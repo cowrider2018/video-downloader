@@ -1,6 +1,6 @@
 # Video Downloader
 
-Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS 串流，一鍵下載。功能參考 Video DownloadHelper。
+Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS 串流，一鍵下載。功能參考 Video DownloadHelper 與貓抓（cat-catch）。
 
 ## 使用方式
 
@@ -14,6 +14,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 ## 功能
 
 - **自動偵測**：監看網路回應（`video/*`、`audio/*`、`.mp4`／`.webm`／`.m3u8` 等），並掃描頁面中的 `<video>`／`<audio>`。
+- **MSE 緩存捕捉**：小視窗開著時，攔截播放器餵給 MediaSource 的資料，讓以 `blob:` 播放、網路上沒有完整檔案的影片也能存下來（影像與音訊各一列）。單一頁面上限 2 GB。
 - **直接下載**：一般影音檔交給 Chrome 下載管理員，檔名取自頁面標題。
 - **HLS 串流**：解析 master playlist 列出所有畫質，平行下載片段、支援 AES-128 解密與 byte-range，合併成單一 `.ts`（fMP4 串流則為 `.mp4`）。音訊獨立的串流會另存一個音訊檔。
 - **Referer 處理**：下載時以 `declarativeNetRequest` 對需要的主機帶上原頁面的 Referer／Origin，避免 CDN 拒絕。
@@ -27,7 +28,9 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 ## 限制
 
 - 不支援 DRM／SAMPLE-AES 加密內容與直播串流。
-- 不支援 DASH（`.mpd`）與以 MediaSource 播放的 `blob:` 影片（例如 YouTube）。
+- 不支援 DASH（`.mpd`）清單解析；以 MediaSource 播放的影片請改用 MSE 緩存捕捉。
+- MSE 緩存捕捉只對小視窗開啟後才載入的頁面有效（已開著的頁面請重新整理），且只存下實際播放過的部分：請從頭播到尾、不要跳轉。影像與音訊為分開的檔案。
+- MSE 檔案由頁面自己觸發下載，第一次存多個檔案時 Chrome 可能會詢問是否允許此網站下載多個檔案。
 - HLS 合併在記憶體中進行，非常大的影片會佔用相當記憶體。
 - 影像與音訊分開的串流會存成兩個檔案，需自行以 ffmpeg 等工具合併。
 
@@ -36,7 +39,8 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 | 檔案 | 角色 |
 | --- | --- |
 | `background.js` | Service worker：開啟視窗、追蹤目前分頁、偵測媒體（`storage.session`）、HLS 解析預覽、下載工作管理、Referer 規則 |
-| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源 |
+| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源；轉接 MSE 攔截腳本 |
+| `inject/mse-hook.js` | 在頁面環境中攔截 `addSourceBuffer`／`appendBuffer`，保存緩衝資料 |
 | `offscreen/` | 執行 HLS 下載：抓片段、解密、組成 Blob（service worker 無法建立 blob URL） |
 | `viewer/` | 小視窗：網址列、目前分頁的媒體清單與下載進度 |
 | `lib/media.js`、`lib/hls.js` | 共用的純函式（分類、檔名、m3u8 解析），有單元測試 |
