@@ -10,7 +10,16 @@
     <form id="bar">
       <input id="addr" type="text" autocomplete="off" spellcheck="false" />
     </form>
-    <ul id="media"></ul>
+    <iframe
+      id="frame"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-downloads allow-modals"
+      allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+    ></iframe>
+    <ul id="media" class="list"></ul>
+    <section id="queue" hidden>
+      <h2>下載中</h2>
+      <ul id="jobs" class="list"></ul>
+    </section>
     <script type="module" src="viewer.js"></script>
   </body>
 </html>

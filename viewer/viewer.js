@@ -1,16 +1,21 @@
 import { audioFor, variantLabel } from '../lib/hls.js';
 import { displayName, filenameFor, formatBytes } from '../lib/media.js';
 
+const tab = await chrome.tabs.getCurrent();
+const mediaKey = `tab:${tab.id}`;
+const pageKey = `page:${tab.id}`;
+
 const addr = document.getElementById('addr');
-const list = document.getElementById('media');
+const frame = document.getElementById('frame');
+const mediaList = document.getElementById('media');
+const jobList = document.getElementById('jobs');
+const queue = document.getElementById('queue');
 
 const send = (msg) => chrome.runtime.sendMessage(msg);
 
-let trackedId = null; // the browser tab being followed
-let page = {}; // { url, title } of that tab
+let page = {}; // { url, title } of the framed page
 let media = [];
 let jobs = [];
-const fileDownloads = new Map(); // url -> Chrome download id, for files started from here
 let editing = false; // the user is typing; don't overwrite the address bar
 
 // ---- Address bar ----------------------------------------------------------------------
@@ -27,12 +32,9 @@ function normalize(input) {
   }
 }
 
-// Navigates the followed tab; the page itself always runs in a real browser tab.
-async function load(url) {
+function load(url) {
+  frame.src = url;
   addr.value = url;
-  const tab = trackedId != null && (await chrome.tabs.get(trackedId).catch(() => null));
-  if (tab) chrome.tabs.update(tab.id, { url });
-  else chrome.tabs.create({ url });
 }
 
 document.getElementById('bar').addEventListener('submit', (e) => {
@@ -48,13 +50,72 @@ addr.addEventListener('focus', () => addr.select());
 addr.addEventListener('input', () => (editing = true));
 addr.addEventListener('blur', () => {
   editing = false;
-  addr.value = page.url || '';
+  if (page.url) addr.value = page.url;
 });
 
-// ---- Media rows -----------------------------------------------------------------------
-// One row per downloadable file; a master playlist contributes one row per quality.
+function applyPage(p = {}) {
+  page = p;
+  document.title = page.title || 'Video Downloader';
+  if (!editing && page.url) addr.value = page.url;
+}
 
-const jobFor = (url) => jobs.find((j) => j.url === url);
+// ---- Rows -----------------------------------------------------------------------------
+// Both lists reuse row elements by key, so a progress update never swaps a button out from
+// under the cursor.
+
+function makeRenderer(list, emptyText) {
+  const rows = new Map();
+  const empty = document.createElement('li');
+  empty.className = 'empty';
+  empty.textContent = emptyText;
+
+  function rowEl(key) {
+    let el = rows.get(key);
+    if (!el) {
+      const li = document.createElement('li');
+      const name = li.appendChild(document.createElement('span'));
+      name.className = 'name';
+      const meta = li.appendChild(document.createElement('span'));
+      meta.className = 'meta';
+      el = { li, name, meta, buttons: [] };
+      rows.set(key, el);
+    }
+    return el;
+  }
+
+  function setButtons(el, specs) {
+    while (el.buttons.length < specs.length) el.buttons.push(el.li.appendChild(document.createElement('button')));
+    while (el.buttons.length > specs.length) el.buttons.pop().remove();
+    specs.forEach((b, i) => {
+      const btn = el.buttons[i];
+      btn.textContent = b.text;
+      btn.title = b.title || '';
+      btn.disabled = !!b.disabled;
+      btn.className = b.error ? 'error' : '';
+      btn.onclick = b.onClick || null;
+    });
+  }
+
+  return (specs) => {
+    const items = specs.map((r) => {
+      const el = rowEl(r.key);
+      el.name.textContent = r.name;
+      el.name.title = r.title || r.name;
+      el.meta.textContent = r.meta.filter(Boolean).join(' · ');
+      el.meta.className = r.metaError ? 'meta error' : 'meta';
+      setButtons(el, r.buttons);
+      return el.li;
+    });
+    const keys = new Set(specs.map((r) => r.key));
+    for (const key of rows.keys()) if (!keys.has(key)) rows.delete(key);
+    const next = items.length || !emptyText ? items : [empty];
+    const same = next.length === list.children.length && next.every((li, i) => list.children[i] === li);
+    if (!same) list.replaceChildren(...next);
+  };
+}
+
+// ---- Detected media -------------------------------------------------------------------
+// One row per downloadable file; a master playlist contributes one row per quality.
 
 function titleForFiles() {
   if (page.title) return page.title;
@@ -74,54 +135,29 @@ function formatDuration(sec) {
   return hh ? `${hh}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
 }
 
-async function startHls(m, url, tag, audio) {
-  const base = { type: 'download-hls', tabId: trackedId, mediaId: m.id, title: titleForFiles() };
-  await send({ ...base, url, tag });
-  if (audio) await send({ ...base, url: audio.url, tag: `音訊${audio.language ? ` ${audio.language}` : ''}` });
+// A row's button says "已加入" for a moment after it queued something.
+const queuedAt = new Map();
+
+function queueButton(key, start) {
+  if (Date.now() - (queuedAt.get(key) || 0) < 1500) return { text: '已加入', disabled: true };
+  return {
+    text: '下載',
+    onClick: async () => {
+      queuedAt.set(key, Date.now());
+      renderMedia();
+      setTimeout(renderMedia, 1600);
+      const res = await start();
+      if (res?.error) alert(res.error);
+    },
+  };
 }
 
-// Button state for a row with a download job (HLS, or a file fetched in the page) follows
-// its most recent job.
-function jobButton(url, start) {
-  const job = jobFor(url);
-  switch (job?.status) {
-    case 'running': {
-      const text = job.total ? `${Math.floor((job.done / job.total) * 100)}%` : formatBytes(job.bytes) || '0%';
-      return { text, title: '點擊取消', onClick: () => send({ type: 'cancel-job', id: job.id }) };
-    }
-    case 'saving':
-      return { text: '存檔中', disabled: true };
-    case 'done':
-      return { text: '顯示', title: job.filename, onClick: () => chrome.downloads.show(job.downloadId) };
-    case 'failed':
-      return { text: '重試', title: job.error, error: true, onClick: start };
-    default:
-      return { text: '下載', onClick: start };
-  }
+function startHls(m, url, tag, audio) {
+  const base = { type: 'download-hls', tabId: tab.id, mediaId: m.id, title: titleForFiles() };
+  const video = send({ ...base, url, tag });
+  if (audio) send({ ...base, url: audio.url, tag: `音訊${audio.language ? ` ${audio.language}` : ''}` });
+  return video;
 }
-
-function fileButton(m) {
-  // The server refused the plain download and the page is fetching it instead.
-  if (jobFor(m.url)) return jobButton(m.url, () => fileStart(m));
-  const id = fileDownloads.get(m.url);
-  if (id != null) return { text: '顯示', onClick: () => chrome.downloads.show(id) };
-  return { text: '下載', onClick: () => fileStart(m) };
-}
-
-async function fileStart(m) {
-  const res = await send({
-    type: 'download',
-    tabId: trackedId,
-    mediaId: m.id,
-    filename: filenameFor(titleForFiles(), m.ext),
-  });
-  if (res?.id != null) fileDownloads.set(m.url, res.id);
-  render();
-}
-
-// MSE captures are saved by the page itself, so there is no download id to track; the
-// button just acknowledges for a moment (the capture may keep growing and can be saved again).
-const mseSavedAt = new Map();
 
 function mseExt(mime) {
   const type = mime.split(';')[0].trim();
@@ -131,149 +167,146 @@ function mseExt(mime) {
   return 'mp4';
 }
 
+// MSE captures are saved by the page itself (the data only exists there).
 function mseRow(m) {
-  const audio = m.mime.startsWith('audio/');
+  const label = m.mime.startsWith('audio/') ? '音訊' : '影像';
   const codec = m.mime.match(/codecs="?([^",]+)/)?.[1] || m.mime.split(';')[0];
-  const label = audio ? '音訊' : '影像';
-  const saved = Date.now() - (mseSavedAt.get(m.url) || 0) < 3000;
+  const button = queueButton(m.url, () =>
+    send({
+      type: 'save-mse',
+      tabId: tab.id,
+      frameId: m.frameId,
+      streamId: m.streamId,
+      filename: filenameFor(titleForFiles(), mseExt(m.mime), label),
+    }),
+  );
+  if (!m.size) button.disabled = true;
   return {
     key: m.url,
     name: `緩存${label} (${codec})`,
     title: m.mime,
     meta: ['MSE', formatBytes(m.size), m.truncated ? '已達上限' : ''],
-    button: saved
-      ? { text: '已存', disabled: true }
-      : {
-          text: '下載',
-          disabled: !m.size,
-          onClick: () => {
-            send({
-              type: 'save-mse',
-              tabId: trackedId,
-              frameId: m.frameId,
-              streamId: m.streamId,
-              filename: filenameFor(titleForFiles(), mseExt(m.mime), label),
-            });
-            mseSavedAt.set(m.url, Date.now());
-            render();
-            setTimeout(render, 3000);
-          },
-        },
+    buttons: [button],
   };
 }
 
 function rowsFor(m) {
   if (m.kind === 'mse') return [mseRow(m)];
   const name = displayName(m.url);
-  if (m.kind === 'file') {
-    return [{ key: m.url, name, title: m.url, meta: [m.ext.toUpperCase(), formatBytes(m.size)], button: fileButton(m) }];
-  }
+  const row = (key, meta, button) => ({ key, name, title: key, meta, buttons: [button] });
   const off = (text, title) => ({ text, title, disabled: true });
-  if (!m.probed) return [{ key: m.url, name, title: m.url, meta: ['HLS'], button: off('解析中') }];
-  if (m.error) return [{ key: m.url, name, title: m.url, meta: ['HLS'], button: off('無法解析', m.error) }];
+  if (m.kind === 'file') {
+    const start = () =>
+      send({ type: 'download', tabId: tab.id, mediaId: m.id, filename: filenameFor(titleForFiles(), m.ext) });
+    return [row(m.url, [m.ext.toUpperCase(), formatBytes(m.size)], queueButton(m.url, start))];
+  }
+  if (!m.probed) return [row(m.url, ['HLS'], off('解析中'))];
+  if (m.error) return [row(m.url, ['HLS'], off('無法解析', m.error))];
   if (m.variants) {
-    return m.variants.map((v) => ({
-      key: v.url,
-      name,
-      title: v.url,
-      meta: ['HLS', variantLabel(v), v.bandwidth ? `${(v.bandwidth / 1e6).toFixed(1)} Mbps` : ''],
-      button: jobButton(v.url, () => startHls(m, v.url, variantLabel(v), audioFor(v, m.audio))),
-    }));
+    return m.variants.map((v) =>
+      row(
+        v.url,
+        ['HLS', variantLabel(v), v.bandwidth ? `${(v.bandwidth / 1e6).toFixed(1)} Mbps` : ''],
+        queueButton(v.url, () => startHls(m, v.url, variantLabel(v), audioFor(v, m.audio))),
+      ),
+    );
   }
   const meta = ['HLS', formatDuration(m.duration)];
-  if (m.live) return [{ key: m.url, name, title: m.url, meta, button: off('直播', '不支援直播串流') }];
-  if (m.encryption && m.encryption !== 'AES-128') {
-    return [{ key: m.url, name, title: m.url, meta, button: off('受保護', `${m.encryption} 加密不支援`) }];
+  if (m.live) return [row(m.url, meta, off('直播', '不支援直播串流'))];
+  if (m.encryption && m.encryption !== 'AES-128') return [row(m.url, meta, off('受保護', `${m.encryption} 加密不支援`))];
+  return [row(m.url, meta, queueButton(m.url, () => startHls(m, m.url, '', null)))];
+}
+
+const renderMediaRows = makeRenderer(mediaList, '尚未偵測到媒體');
+const renderMedia = () => renderMediaRows(media.filter((m) => !m.parent).flatMap(rowsFor));
+
+// ---- Download queue -------------------------------------------------------------------
+
+// Native downloads report progress through chrome.downloads, not the job record.
+const nativeProgress = new Map(); // downloadId -> { bytes, total }
+
+function progressText(j) {
+  if (j.kind === 'native') {
+    const p = nativeProgress.get(j.downloadId);
+    if (!p) return '下載中';
+    return p.total > 0 ? `${Math.floor((p.bytes / p.total) * 100)}% · ${formatBytes(p.total)}` : formatBytes(p.bytes);
   }
-  return [{ key: m.url, name, title: m.url, meta, button: jobButton(m.url, () => startHls(m, m.url, '', null)) }];
+  if (!j.total) return j.bytes ? formatBytes(j.bytes) : '準備中';
+  const pct = `${Math.floor((j.done / j.total) * 100)}%`;
+  return j.kind === 'hls' ? `${pct} · ${j.done}/${j.total} 片段` : `${pct} · ${formatBytes(j.total)}`;
 }
 
-// Rows are reused by key, so a progress update never swaps a button out from under the cursor.
-const rowEls = new Map();
-
-function rowEl(key) {
-  let el = rowEls.get(key);
-  if (!el) {
-    const li = document.createElement('li');
-    const name = li.appendChild(document.createElement('span'));
-    name.className = 'name';
-    const meta = li.appendChild(document.createElement('span'));
-    meta.className = 'meta';
-    const button = li.appendChild(document.createElement('button'));
-    el = { li, name, meta, button };
-    rowEls.set(key, el);
+function jobRow(j) {
+  const remove = { text: '✕', title: '從清單移除', onClick: () => send({ type: 'remove-job', id: j.id }) };
+  const spec = { key: j.id, name: j.filename, title: j.url, meta: [], buttons: [] };
+  switch (j.status) {
+    case 'running':
+      spec.meta = [progressText(j)];
+      spec.buttons = [{ text: '取消', onClick: () => send({ type: 'cancel-job', id: j.id }) }];
+      break;
+    case 'saving':
+      spec.meta = ['存檔中'];
+      break;
+    case 'done':
+      spec.meta = ['完成', formatBytes(j.bytes || nativeProgress.get(j.downloadId)?.total)];
+      spec.buttons = [{ text: '顯示', onClick: () => chrome.downloads.show(j.downloadId) }, remove];
+      break;
+    case 'failed':
+      spec.meta = [`失敗：${j.error || '未知錯誤'}`];
+      spec.metaError = true;
+      spec.buttons = [remove];
+      break;
+    default:
+      spec.meta = ['已取消'];
+      spec.buttons = [remove];
   }
-  return el;
+  return spec;
 }
 
-const emptyRow = document.createElement('li');
-emptyRow.className = 'empty';
-emptyRow.textContent = '尚未偵測到媒體';
+const renderJobRows = makeRenderer(jobList, '');
 
-function render() {
-  const rows = media.filter((m) => !m.parent).flatMap(rowsFor);
-  const items = rows.map((r) => {
-    const el = rowEl(r.key);
-    el.name.textContent = r.name;
-    el.name.title = r.title;
-    el.meta.textContent = r.meta.filter(Boolean).join(' · ');
-    el.button.textContent = r.button.text;
-    el.button.title = r.button.title || '';
-    el.button.disabled = !!r.button.disabled;
-    el.button.className = r.button.error ? 'error' : '';
-    el.button.onclick = r.button.onClick || null;
-    return el.li;
-  });
-  const keys = new Set(rows.map((r) => r.key));
-  for (const key of rowEls.keys()) if (!keys.has(key)) rowEls.delete(key);
-
-  const next = items.length ? items : [emptyRow];
-  const same = next.length === list.children.length && next.every((li, i) => list.children[i] === li);
-  if (!same) list.replaceChildren(...next);
+function renderJobs() {
+  queue.hidden = !jobs.length;
+  renderJobRows(jobs.map(jobRow));
 }
 
-function applyPage(tab) {
-  page = tab ? { url: tab.url || '', title: tab.title || '' } : {};
-  document.title = page.title || 'Video Downloader';
-  if (!editing) addr.value = page.url || '';
+async function pollNative() {
+  const active = jobs.filter((j) => j.kind === 'native' && j.downloadId != null);
+  if (!active.length) return;
+  const items = await chrome.downloads.search({});
+  const byId = new Map(items.map((d) => [d.id, d]));
+  for (const j of active) {
+    const d = byId.get(j.downloadId);
+    if (d) nativeProgress.set(j.downloadId, { bytes: d.bytesReceived, total: d.totalBytes });
+  }
+  renderJobs();
 }
 
-const mediaKey = () => `tab:${trackedId}`;
-
-// Switching tabs quickly starts overlapping follows; only the latest may apply its results.
-let followSeq = 0;
-
-async function follow(tabId) {
-  const seq = ++followSeq;
-  trackedId = tabId ?? null;
-  const key = mediaKey();
-  const [stored, tab] = await Promise.all([
-    chrome.storage.session.get(key),
-    trackedId != null ? chrome.tabs.get(trackedId).catch(() => null) : null,
-  ]);
-  if (seq !== followSeq) return;
-  media = stored[key] || [];
-  applyPage(tab);
-  render();
-}
+setInterval(pollNative, 700);
 
 // ---- Startup --------------------------------------------------------------------------
 
-await send({ type: 'capture-on' });
-
-// Listen before the first read so nothing that changes in between is missed.
 chrome.storage.session.onChanged.addListener((changes) => {
-  if (changes.jobs) jobs = changes.jobs.newValue || [];
-  if (changes.tracked) return void follow(changes.tracked.newValue);
-  if (changes[mediaKey()]) media = changes[mediaKey()].newValue || [];
-  if (changes[mediaKey()] || changes.jobs) render();
+  if (changes[pageKey]) applyPage(changes[pageKey].newValue);
+  if (changes[mediaKey]) {
+    media = changes[mediaKey].newValue || [];
+    renderMedia();
+  }
+  if (changes.jobs) {
+    jobs = changes.jobs.newValue || [];
+    renderJobs();
+  }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (tabId === trackedId && (info.url || info.title)) applyPage(tab);
-});
+await send({ type: 'viewer-open' });
 
-const stored = await chrome.storage.session.get(['tracked', 'jobs']);
+const stored = await chrome.storage.session.get([mediaKey, pageKey, 'jobs']);
+media = stored[mediaKey] || [];
 jobs = stored.jobs || [];
-if (!followSeq) await follow(stored.tracked);
-if (!page.url) addr.focus();
+applyPage(stored[pageKey]);
+renderMedia();
+renderJobs();
+
+const initial = normalize(new URL(location.href).searchParams.get('url') || page.url || '');
+if (initial) load(initial);
+else addr.focus();

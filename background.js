@@ -5,14 +5,15 @@ import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
 // Everything lives in storage.session because the service worker can be torn down at any
 // moment and in-memory state would be lost with it:
 //   tab:<id>   media detected in that tab
-//   tracked    id of the browser tab the viewer window is following
-//   jobs       HLS download jobs
-//   fallbacks  { [downloadId]: { tabId, mediaId, filename } } file downloads that retry in
-//              the page if the server refuses the extension's own request
+//   page:<id>  { url, title } of the page framed in a viewer tab
+//   ids:<id>   { [host]: headers } the tab's latest request identity per host
+//   viewers    { [tabId]: ruleId } open viewer tabs and their frame-header rule
+//   jobs       downloads, newest first
 const tabKey = (tabId) => `tab:${tabId}`;
-const TRACKED = 'tracked';
+const pageKey = (tabId) => `page:${tabId}`;
+const idsKey = (tabId) => `ids:${tabId}`;
+const VIEWERS = 'viewers';
 const JOBS = 'jobs';
-const FALLBACKS = 'fallbacks';
 const VIEWER_PAGE = 'viewer/viewer.html';
 
 const chains = new Map();
@@ -31,6 +32,13 @@ function update(key, fn) {
   chains.set(key, run.catch((e) => console.error(e)));
   return run;
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const newRuleId = () => 1 + Math.floor(Math.random() * 0x7ffffffe);
+const removeRules = (ids) =>
+  ids.length ? chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids }).catch(() => {}) : null;
+
+// ---- Detected media -------------------------------------------------------------------
 
 // A variant or audio playlist already offered through its master is hidden behind it.
 function linkChildren(list) {
@@ -70,15 +78,79 @@ async function addMedia(tabId, item) {
   if (added?.kind === 'hls') probe(tabId, added);
 }
 
-// The tab's top frame committed a new document: start a fresh list for it.
-async function navigated(tabId) {
+async function findMedia(tabId, mediaId) {
+  const { [tabKey(tabId)]: list = [] } = await chrome.storage.session.get(tabKey(tabId));
+  return list.find((m) => m.id === mediaId) || null;
+}
+
+// A new page is showing (top frame, or the frame inside a viewer): start a fresh list.
+// Downloads are not tied to the page and keep running.
+async function navigated(tabId, url) {
   await update(tabKey(tabId), () => []);
-  abandonJobs(tabId);
+  if (url) await update(pageKey(tabId), () => ({ url, title: '' }));
+}
+
+// ---- Request identity -----------------------------------------------------------------
+// The headers each tab last sent to each host: cookies (SameSite and partitioned ones
+// included, as the page saw them), referer, origin, auth and custom player headers.
+// A download takes a snapshot when it is queued and replays it, so it neither needs the
+// page to stay open nor picks up the identity of whatever page is shown later.
+
+const identities = new Map(); // tabId -> { [host]: headers }
+
+async function identityOf(tabId) {
+  if (!identities.has(tabId)) {
+    const { [idsKey(tabId)]: stored = {} } = await chrome.storage.session.get(idsKey(tabId));
+    if (!identities.has(tabId)) identities.set(tabId, stored);
+  }
+  return identities.get(tabId);
+}
+
+async function rememberIdentity(tabId, url, headers) {
+  const host = new URL(url).hostname;
+  const ids = await identityOf(tabId);
+  if (JSON.stringify(ids[host]) === JSON.stringify(headers)) return;
+  ids[host] = headers;
+  chrome.storage.session.set({ [idsKey(tabId)]: ids });
+}
+
+// The identity a download of `item` should present, per host: the media's own request
+// for its host, what the page last sent elsewhere (e.g. segment CDNs), and for hosts the
+// page never contacted, at least its referer, origin and custom player headers.
+async function snapshotIdentity(tabId, item) {
+  const hosts = { ...(await identityOf(tabId)) };
+  const own = new URL(item.url).hostname;
+  if (item.headers) hosts[own] = { ...hosts[own], ...item.headers };
+  const fallback = { ...pageHeaders(item.headers) };
+  for (const k of ['referer', 'origin']) if (item.headers?.[k]) fallback[k] = item.headers[k];
+  return { hosts, fallback };
+}
+
+// One session rule per host for requests the extension itself makes (tabId -1).
+async function installIdentity(job, hosts) {
+  const known = { ...(job.rules || {}) };
+  const addRules = [];
+  for (const host of hosts) {
+    if (known[host]) continue;
+    const headers = job.identity?.hosts[host] || job.identity?.fallback || {};
+    const requestHeaders = Object.entries(headers).map(([header, value]) => ({ header, operation: 'set', value }));
+    if (!requestHeaders.length) continue;
+    known[host] = newRuleId();
+    addRules.push({
+      id: known[host],
+      priority: 1,
+      action: { type: 'modifyHeaders', requestHeaders },
+      condition: { requestDomains: [host], tabIds: [chrome.tabs.TAB_ID_NONE], resourceTypes: ['xmlhttprequest'] },
+    });
+  }
+  if (!addRules.length) return;
+  await chrome.declarativeNetRequest.updateSessionRules({ addRules });
+  await patchJob(job.id, { rules: known });
 }
 
 // ---- Viewer window --------------------------------------------------------------------
-// A standalone window listing the media of whichever normal browser tab is active, so the
-// page itself runs in a real tab (nothing to block) and the list never closes on a click.
+// A standalone window: address bar, the page framed inside it, detected media and the
+// download queue.
 
 async function viewerContext() {
   const prefix = chrome.runtime.getURL(VIEWER_PAGE);
@@ -86,21 +158,54 @@ async function viewerContext() {
   return contexts.find((c) => c.documentUrl?.startsWith(prefix)) || null;
 }
 
-async function track(tabId) {
-  await chrome.storage.session.set({ [TRACKED]: tabId });
+let viewersCache = null;
+
+async function getViewers() {
+  viewersCache ??= (await chrome.storage.session.get(VIEWERS))[VIEWERS] || {};
+  return viewersCache;
 }
 
-async function trackActiveIn(windowId) {
-  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
-  const win = await chrome.windows.get(windowId, { populate: true }).catch(() => null);
-  if (win?.type !== 'normal') return;
-  const active = win.tabs.find((t) => t.active);
-  // Never follow the extension's own pages (e.g. the viewer opened as a normal tab).
-  if (active && !active.url?.startsWith(chrome.runtime.getURL(''))) track(active.id);
+const isViewer = async (tabId) => String(tabId) in (await getViewers());
+
+// Sites refuse to be framed via X-Frame-Options / CSP frame-ancestors; strip both, but only
+// for frames inside this viewer tab.
+async function registerViewer(tabId) {
+  const viewers = await getViewers();
+  const ruleId = viewers[tabId] ?? newRuleId();
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [ruleId],
+    addRules: [
+      {
+        id: ruleId,
+        priority: 2,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [
+            { header: 'x-frame-options', operation: 'remove' },
+            { header: 'content-security-policy', operation: 'remove' },
+          ],
+        },
+        condition: { tabIds: [tabId], resourceTypes: ['sub_frame'] },
+      },
+    ],
+  });
+  viewersCache = await update(VIEWERS, (v = {}) => ({ ...v, [tabId]: ruleId }));
+  await setCapture(true);
 }
 
-// MSE capture hook: registered only while a viewer window exists, since it keeps a copy of
-// everything a player buffers. Pages loaded before that are not captured.
+async function unregisterViewer(tabId) {
+  const viewers = await getViewers();
+  if (!(tabId in viewers)) return;
+  removeRules([viewers[tabId]]);
+  viewersCache = await update(VIEWERS, (v = {}) => {
+    const { [tabId]: _, ...rest } = v;
+    return rest;
+  });
+  if (!Object.keys(viewersCache).length) setCapture(false).catch(() => {});
+}
+
+// MSE capture hook: registered only while a viewer exists, since it keeps a copy of
+// everything a player buffers.
 const HOOK_ID = 'vd-mse-hook';
 
 async function setCapture(on) {
@@ -123,62 +228,35 @@ async function setCapture(on) {
 }
 
 async function openViewer(tab) {
-  if (tab?.id != null) await track(tab.id);
   const existing = await viewerContext();
   if (existing) {
     await chrome.windows.update(existing.windowId, { focused: true });
     return;
   }
+  const start = /^https?:/i.test(tab?.url || '') ? `?url=${encodeURIComponent(tab.url)}` : '';
   await chrome.windows.create({
-    url: chrome.runtime.getURL(VIEWER_PAGE),
+    url: chrome.runtime.getURL(VIEWER_PAGE) + start,
     type: 'popup',
-    width: 620,
-    height: 460,
+    width: 1000,
+    height: 860,
   });
 }
 
-// ---- File downloads -------------------------------------------------------------------
-// chrome.downloads streams straight to disk and sends the browser's cookies plus the
-// player's custom headers, but it can never send the page's Referer or Origin. If the
-// server refuses it, the file is fetched again inside the page (see startPageJob).
-
-async function findMedia(tabId, mediaId) {
-  const { [tabKey(tabId)]: list = [] } = await chrome.storage.session.get(tabKey(tabId));
-  return list.find((m) => m.id === mediaId) || null;
-}
-
-async function downloadFile({ tabId, mediaId, filename }) {
-  const item = await findMedia(tabId, mediaId);
-  if (!item) throw new Error('找不到這個媒體，頁面可能已經換頁');
-  const headers = Object.entries(pageHeaders(item.headers)).map(([name, value]) => ({ name, value }));
-  const start = (h) => chrome.downloads.download({ url: item.url, filename, conflictAction: 'uniquify', headers: h });
-  // A header the downloads API considers unsafe makes it refuse outright; go without them.
-  const id = await start(headers).catch(() => start([]));
-  await update(FALLBACKS, (f = {}) => ({ ...f, [id]: { tabId, mediaId, filename } }));
-  return id;
-}
-
-// ---- Asking the page ------------------------------------------------------------------
-// Playlists and segments are fetched by the content script in the frame that loaded them,
-// i.e. with the page's own origin, cookies and referer.
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ---- HLS probing ----------------------------------------------------------------------
+// The frame that loaded a playlist fetches it again, as itself, so the viewer can show
+// qualities, length and whether the stream is downloadable at all.
 
 // The content script may not be listening yet right after a navigation; retry briefly.
 async function askPage(tabId, frameId, msg, tries = 6) {
   for (let i = 1; ; i++) {
     try {
       return await chrome.tabs.sendMessage(tabId, msg, { frameId: frameId ?? 0 });
-    } catch (e) {
+    } catch {
       if (i >= tries) throw new Error('無法連到頁面，請重新整理後再試');
       await sleep(500);
     }
   }
 }
-
-// ---- HLS probing ----------------------------------------------------------------------
-// Fetches a freshly detected playlist so the viewer can show qualities, length and
-// whether the stream is downloadable at all.
 
 async function probe(tabId, item) {
   let info;
@@ -207,9 +285,13 @@ async function probe(tabId, item) {
   );
 }
 
-// ---- HLS jobs -------------------------------------------------------------------------
-// The page's content script downloads and assembles the stream; the service worker keeps
-// the job record and saves the finished blob.
+// ---- Downloads ------------------------------------------------------------------------
+// Every download is a job in the queue, independent of the page it came from:
+//   native  a file handed to chrome.downloads (streams to disk; sends cookies and the
+//           player's custom headers, but never the page's referer or origin);
+//   file    the same file fetched by the offscreen document with the page's full identity,
+//           used when the server refuses the native download;
+//   hls     a stream assembled by the offscreen document with the page's identity.
 
 const patchJob = (id, patch) =>
   update(JOBS, (jobs = []) => jobs.map((j) => (j.id === id ? { ...j, ...patch } : j)));
@@ -219,112 +301,145 @@ async function findJob(pred) {
   return jobs.find(pred) || null;
 }
 
-// kind 'hls' assembles a stream; kind 'file' fetches one file whole (the fallback above).
-async function startPageJob({ kind = 'hls', tabId, mediaId, url, title, tag, filename }) {
+async function newJob(fields) {
+  const job = { id: crypto.randomUUID(), status: 'running', done: 0, total: 0, bytes: 0, startedAt: Date.now(), ...fields };
+  await update(JOBS, (jobs = []) => [job, ...jobs]);
+  return job;
+}
+
+let creatingOffscreen = null;
+
+async function ensureOffscreen() {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (contexts.length) return;
+  creatingOffscreen ??= chrome.offscreen
+    .createDocument({
+      url: 'offscreen/offscreen.html',
+      reasons: ['BLOBS'],
+      justification: 'Download and assemble media files in the background.',
+    })
+    .finally(() => (creatingOffscreen = null));
+  await creatingOffscreen;
+}
+
+const toOffscreen = (msg) => chrome.runtime.sendMessage({ target: 'offscreen', ...msg }).catch(() => {});
+
+async function runInOffscreen(job, item) {
+  await ensureOffscreen();
+  toOffscreen({
+    type: 'job-start',
+    job: { id: job.id, kind: job.kind, url: job.url, ext: item.ext, headers: pageHeaders(item.headers) },
+  });
+}
+
+async function downloadFile({ tabId, mediaId, filename }) {
   const item = await findMedia(tabId, mediaId);
   if (!item) throw new Error('找不到這個媒體，頁面可能已經換頁');
-  url ??= item.url;
-  const job = {
-    id: crypto.randomUUID(),
-    kind,
+  const headers = Object.entries(pageHeaders(item.headers)).map(([name, value]) => ({ name, value }));
+  const job = await newJob({
+    kind: 'native',
     tabId,
-    frameId: item.frameId ?? 0,
-    url,
-    title,
-    tag,
-    filename: filename || filenameFor(title, 'ts', tag),
-    status: 'running',
-    done: 0,
-    total: 0,
-    bytes: 0,
-    startedAt: Date.now(),
-  };
-  await update(JOBS, (jobs = []) => [job, ...jobs]);
+    url: item.url,
+    filename,
+    ext: item.ext,
+    item,
+    identity: await snapshotIdentity(tabId, item),
+  });
+  const start = (h) => chrome.downloads.download({ url: item.url, filename, conflictAction: 'uniquify', headers: h });
   try {
-    await askPage(tabId, job.frameId, {
-      type: 'job-start',
-      job: { id: job.id, kind, url, ext: item.ext, headers: pageHeaders(item.headers) },
-    });
+    // A header the downloads API considers unsafe makes it refuse outright; go without them.
+    const downloadId = await start(headers).catch(() => start([]));
+    await patchJob(job.id, { downloadId });
   } catch (e) {
     await patchJob(job.id, { status: 'failed', error: e.message });
   }
 }
 
-const releaseJob = (job) =>
-  chrome.tabs.sendMessage(job.tabId, { type: 'job-release', id: job.id }, { frameId: job.frameId }).catch(() => {});
+async function startHls({ tabId, mediaId, url, title, tag }) {
+  const item = await findMedia(tabId, mediaId);
+  if (!item) throw new Error('找不到這個串流，頁面可能已經換頁');
+  const job = await newJob({
+    kind: 'hls',
+    tabId,
+    url,
+    title,
+    tag,
+    filename: filenameFor(title, 'ts', tag),
+    identity: await snapshotIdentity(tabId, item),
+  });
+  await runInOffscreen(job, item);
+}
 
-// Saves the blob the page assembled. The reply tells the page to save it itself when the
-// downloads API refuses a blob URL from the page's origin.
+// A native download the server refused: fetch it again with the page's identity.
+async function retryAsPage(job) {
+  const item = job.item;
+  await patchJob(job.id, { kind: 'file', status: 'running', downloadId: null });
+  await runInOffscreen({ ...job, kind: 'file' }, item);
+}
+
 async function onJobReady({ id, blobUrl, ext, size }) {
   const job = await findJob((j) => j.id === id);
-  if (!job) return {};
-  const filename = job.kind === 'file' ? job.filename : filenameFor(job.title, ext, job.tag);
-  await patchJob(id, { status: 'saving', filename, bytes: size, blobUrl });
+  if (!job) return;
+  const filename = job.kind === 'hls' ? filenameFor(job.title, ext, job.tag) : job.filename;
+  await patchJob(id, { status: 'saving', filename, bytes: size, done: job.total || size, total: job.total || size });
   try {
     const downloadId = await chrome.downloads.download({ url: blobUrl, filename, conflictAction: 'uniquify' });
     await patchJob(id, { downloadId });
-    return {};
-  } catch {
-    return { anchor: true, filename };
+  } catch (e) {
+    await patchJob(id, { status: 'failed', error: e.message });
+    finishJob(job);
   }
 }
 
+// Drops the job's header rules and blob; closes the offscreen document when idle.
+async function finishJob(job) {
+  const latest = (await findJob((j) => j.id === job.id)) || job;
+  removeRules(Object.values(latest.rules || {}));
+  toOffscreen({ type: 'release', id: job.id });
+  const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
+  const busy = jobs.some((j) => j.kind !== 'native' && (j.status === 'running' || j.status === 'saving'));
+  if (!busy) chrome.offscreen.closeDocument().catch(() => {});
+}
+
 async function onJobFailed({ id, cancelled, error }) {
+  const job = await findJob((j) => j.id === id);
   await patchJob(id, cancelled ? { status: 'cancelled' } : { status: 'failed', error });
+  if (job) finishJob(job);
 }
 
 async function cancelJob(id) {
   const job = await findJob((j) => j.id === id);
-  if (!job) return;
-  try {
-    await chrome.tabs.sendMessage(job.tabId, { type: 'job-cancel', id }, { frameId: job.frameId });
-  } catch {
+  if (!job || job.status !== 'running') return;
+  if (job.kind === 'native') {
     await patchJob(id, { status: 'cancelled' });
+    if (job.downloadId != null) chrome.downloads.cancel(job.downloadId).catch(() => {});
+    return;
   }
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (contexts.length) toOffscreen({ type: 'cancel', id });
+  else await patchJob(id, { status: 'cancelled' });
 }
-
-// A job runs inside its page, so leaving the page ends it.
-async function abandonJobs(tabId) {
-  await update(JOBS, (jobs = []) =>
-    jobs.some((j) => j.tabId === tabId && j.status === 'running')
-      ? jobs.map((j) => (j.tabId === tabId && j.status === 'running' ? { ...j, status: 'failed', error: '頁面已離開' } : j))
-      : undefined,
-  );
-}
-
-// Downloads the page started itself (anchor fallback) are matched to their job by URL.
-chrome.downloads.onCreated.addListener(async (item) => {
-  if (!item.url.startsWith('blob:')) return;
-  const job = await findJob((j) => j.blobUrl === item.url && j.downloadId == null);
-  if (job) patchJob(job.id, { downloadId: item.id });
-});
 
 chrome.downloads.onChanged.addListener(async (delta) => {
   const state = delta.state?.current;
   if (state !== 'complete' && state !== 'interrupted') return;
-  const readFallback = async () => (await chrome.storage.session.get(FALLBACKS))[FALLBACKS]?.[delta.id];
-  let fallback = await readFallback();
-  // A fast refusal can arrive before downloadFile() has recorded the fallback.
-  if (!fallback && state === 'interrupted') {
+  let job = await findJob((j) => j.downloadId === delta.id);
+  // A fast refusal can arrive before downloadFile() has stored the download id.
+  if (!job && state === 'interrupted') {
     await sleep(300);
-    fallback = await readFallback();
+    job = await findJob((j) => j.downloadId === delta.id);
   }
-  if (fallback) {
-    update(FALLBACKS, (f = {}) => {
-      const { [delta.id]: _, ...rest } = f;
-      return rest;
-    });
-    // The server wanted the page's identity: drop the failed entry and fetch as the page.
-    if (state === 'interrupted' && /^SERVER_/.test(delta.error?.current || '')) {
-      chrome.downloads.erase({ id: delta.id }).catch(() => {});
-      startPageJob({ kind: 'file', ...fallback }).catch((e) => console.error(e));
-    }
+  if (!job || job.status === 'cancelled') return;
+  if (state === 'complete') {
+    await patchJob(job.id, { status: 'done' });
+  } else if (job.kind === 'native' && /^SERVER_/.test(delta.error?.current || '')) {
+    chrome.downloads.erase({ id: delta.id }).catch(() => {});
+    retryAsPage(job).catch((e) => patchJob(job.id, { status: 'failed', error: e.message }));
     return;
+  } else {
+    await patchJob(job.id, { status: 'failed', error: delta.error?.current || '存檔被中斷' });
   }
-  const job = await findJob((j) => j.downloadId === delta.id);
-  if (!job) return;
-  await patchJob(job.id, state === 'complete' ? { status: 'done' } : { status: 'failed', error: '存檔被中斷' });
-  releaseJob(job);
+  if (job.kind !== 'native') finishJob(job);
 });
 
 // ---- Wiring ---------------------------------------------------------------------------
@@ -339,7 +454,10 @@ const sentHeaders = new Map();
 
 chrome.webRequest.onSendHeaders.addListener(
   (d) => {
-    if (d.tabId >= 0) sentHeaders.set(d.requestId, identityHeaders(d.requestHeaders));
+    if (d.tabId < 0) return;
+    const headers = identityHeaders(d.requestHeaders);
+    sentHeaders.set(d.requestId, headers);
+    rememberIdentity(d.tabId, d.url, headers);
   },
   MEDIA_FILTER,
   ['requestHeaders', 'extraHeaders'],
@@ -363,21 +481,34 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders'],
 );
 
-chrome.webNavigation.onCommitted.addListener((d) => {
-  if (d.frameId === 0) navigated(d.tabId);
+// In a viewer the page lives in the frame directly under the viewer page.
+chrome.webNavigation.onCommitted.addListener(async (d) => {
+  const viewer = await isViewer(d.tabId);
+  if (d.frameId === 0 && !viewer) navigated(d.tabId);
+  else if (viewer && d.parentFrameId === 0 && /^https?:/i.test(d.url)) navigated(d.tabId, d.url);
 });
 
-chrome.tabs.onActivated.addListener(({ windowId }) => trackActiveIn(windowId));
-chrome.windows.onFocusChanged.addListener(trackActiveIn);
-
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  chrome.storage.session.remove(tabKey(tabId));
-  chains.delete(tabKey(tabId));
-  if (!(await viewerContext())) setCapture(false).catch(() => {});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove([tabKey(tabId), pageKey(tabId), idsKey(tabId)]);
+  for (const key of [tabKey(tabId), pageKey(tabId)]) chains.delete(key);
+  identities.delete(tabId);
+  unregisterViewer(tabId);
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (msg.target === 'offscreen') return;
   switch (msg.type) {
+    case 'viewer-open':
+      registerViewer(sender.tab.id).then(() => reply(true), (e) => reply({ error: e.message }));
+      return true;
+    case 'page-title': {
+      const tabId = sender.tab?.id;
+      if (tabId == null) return;
+      isViewer(tabId).then((yes) => {
+        if (yes) update(pageKey(tabId), (p = {}) => ({ ...p, title: msg.title }));
+      });
+      return;
+    }
     case 'dom-media': {
       const tabId = sender.tab?.id;
       if (tabId == null) return;
@@ -409,30 +540,33 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         .sendMessage(msg.tabId, { type: 'mse-save', id: msg.streamId, filename: msg.filename }, { frameId: msg.frameId })
         .catch(() => {});
       return;
-    case 'capture-on':
-      setCapture(true).then(() => reply(true), (e) => reply({ error: e.message }));
-      return true;
     case 'download':
-      downloadFile(msg).then((id) => reply({ id }), (e) => reply({ error: e.message }));
+      downloadFile(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
     case 'download-hls':
-      startPageJob({ ...msg, kind: 'hls' }).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
+      startHls(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
     case 'cancel-job':
       cancelJob(msg.id);
       return;
+    case 'remove-job':
+      update(JOBS, (jobs = []) => jobs.filter((j) => j.id !== msg.id || j.status === 'running' || j.status === 'saving'));
+      return;
+    case 'identity':
+      findJob((j) => j.id === msg.id)
+        .then((job) => job && installIdentity(job, msg.hosts))
+        .then(() => reply(true), (e) => reply({ error: e.message }));
+      return true;
     case 'job-progress':
       update(JOBS, (jobs = []) =>
         jobs.map((j) =>
-          j.id === msg.id && j.status === 'running'
-            ? { ...j, done: msg.done, total: msg.total, bytes: msg.bytes }
-            : j,
+          j.id === msg.id && j.status === 'running' ? { ...j, done: msg.done, total: msg.total, bytes: msg.bytes } : j,
         ),
       );
       return;
     case 'job-ready':
-      onJobReady(msg).then(reply, () => reply({}));
-      return true;
+      onJobReady(msg);
+      return;
     case 'job-failed':
       onJobFailed(msg);
       return;
