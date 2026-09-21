@@ -7,7 +7,9 @@
     "webRequest",
     "downloads",
     "storage",
-    "tabs"
+    "tabs",
+    "offscreen",
+    "declarativeNetRequestWithHostAccess"
   ],
   "host_permissions": [
     "<all_urls>"
