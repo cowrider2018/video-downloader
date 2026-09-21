@@ -189,29 +189,38 @@ function applyPage(tab) {
 
 const mediaKey = () => `tab:${trackedId}`;
 
+// Switching tabs quickly starts overlapping follows; only the latest may apply its results.
+let followSeq = 0;
+
 async function follow(tabId) {
+  const seq = ++followSeq;
   trackedId = tabId ?? null;
   const key = mediaKey();
-  const stored = await chrome.storage.session.get(key);
+  const [stored, tab] = await Promise.all([
+    chrome.storage.session.get(key),
+    trackedId != null ? chrome.tabs.get(trackedId).catch(() => null) : null,
+  ]);
+  if (seq !== followSeq) return;
   media = stored[key] || [];
-  applyPage(trackedId != null ? await chrome.tabs.get(trackedId).catch(() => null) : null);
+  applyPage(tab);
   render();
 }
 
 // ---- Startup --------------------------------------------------------------------------
 
-const stored = await chrome.storage.session.get(['tracked', 'jobs']);
-jobs = stored.jobs || [];
-await follow(stored.tracked);
-if (!page.url) addr.focus();
-
+// Listen before the first read so nothing that changes in between is missed.
 chrome.storage.session.onChanged.addListener((changes) => {
+  if (changes.jobs) jobs = changes.jobs.newValue || [];
   if (changes.tracked) return void follow(changes.tracked.newValue);
   if (changes[mediaKey()]) media = changes[mediaKey()].newValue || [];
-  if (changes.jobs) jobs = changes.jobs.newValue || [];
   if (changes[mediaKey()] || changes.jobs) render();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (tabId === trackedId && (info.url || info.title)) applyPage(tab);
 });
+
+const stored = await chrome.storage.session.get(['tracked', 'jobs']);
+jobs = stored.jobs || [];
+if (!followSeq) await follow(stored.tracked);
+if (!page.url) addr.focus();

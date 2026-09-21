@@ -76,7 +76,8 @@ async function trackActiveIn(windowId) {
   const win = await chrome.windows.get(windowId, { populate: true }).catch(() => null);
   if (win?.type !== 'normal') return;
   const active = win.tabs.find((t) => t.active);
-  if (active) track(active.id);
+  // Never follow the extension's own pages (e.g. the viewer opened as a normal tab).
+  if (active && !active.url?.startsWith(chrome.runtime.getURL(''))) track(active.id);
 }
 
 async function openViewer(tab) {
