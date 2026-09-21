@@ -99,7 +99,8 @@ async function findMedia(tabId, mediaId) {
 // Downloads are not tied to the page and keep running.
 async function navigated(tabId, url) {
   await update(tabKey(tabId), () => []);
-  if (url) await update(pageKey(tabId), () => ({ url, title: '' }));
+  // The new page may have reported its title before this (the two race): use it then.
+  if (url) await update(pageKey(tabId), (p = {}) => ({ url, title: p.early?.url === url ? p.early.title : '' }));
   // An MSE capture lives in the page, unlike every other download.
   await update(JOBS, (jobs = []) =>
     jobs.some((j) => j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status))
@@ -662,7 +663,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       const tabId = sender.tab?.id;
       if (tabId == null) return;
       isViewer(tabId).then((yes) => {
-        if (yes) update(pageKey(tabId), (p = {}) => ({ ...p, title: msg.title }));
+        if (yes) {
+          update(pageKey(tabId), (p = {}) =>
+            p.url === msg.url ? { ...p, title: msg.title } : { ...p, early: { url: msg.url, title: msg.title } },
+          );
+        }
       });
       return;
     }

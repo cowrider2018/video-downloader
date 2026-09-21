@@ -225,7 +225,7 @@
     const sendTitle = () => {
       if (document.title === last) return;
       last = document.title;
-      send({ type: 'page-title', title: last });
+      send({ type: 'page-title', title: last, url: location.href });
     };
     const watch = () => {
       sendTitle();
