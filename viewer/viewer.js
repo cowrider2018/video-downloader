@@ -1,20 +1,17 @@
 import { audioFor, variantLabel } from '../lib/hls.js';
 import { displayName, filenameFor, formatBytes } from '../lib/media.js';
 
-const tab = await chrome.tabs.getCurrent();
-const mediaKey = `tab:${tab.id}`;
-const pageKey = `page:${tab.id}`;
-
 const addr = document.getElementById('addr');
-const frame = document.getElementById('frame');
 const list = document.getElementById('media');
 
 const send = (msg) => chrome.runtime.sendMessage(msg);
 
-let page = {};
+let trackedId = null; // the browser tab being followed
+let page = {}; // { url, title } of that tab
 let media = [];
 let jobs = [];
 const fileDownloads = new Map(); // url -> Chrome download id, for files started from here
+let editing = false; // the user is typing; don't overwrite the address bar
 
 // ---- Address bar ----------------------------------------------------------------------
 
@@ -30,20 +27,29 @@ function normalize(input) {
   }
 }
 
-function load(url) {
-  frame.src = url;
+// Navigates the followed tab; the page itself always runs in a real browser tab.
+async function load(url) {
   addr.value = url;
+  const tab = trackedId != null && (await chrome.tabs.get(trackedId).catch(() => null));
+  if (tab) chrome.tabs.update(tab.id, { url });
+  else chrome.tabs.create({ url });
 }
 
 document.getElementById('bar').addEventListener('submit', (e) => {
   e.preventDefault();
   const url = normalize(addr.value);
   if (!url) return;
+  editing = false;
   load(url);
   addr.blur();
 });
 
 addr.addEventListener('focus', () => addr.select());
+addr.addEventListener('input', () => (editing = true));
+addr.addEventListener('blur', () => {
+  editing = false;
+  addr.value = page.url || '';
+});
 
 // ---- Media rows -----------------------------------------------------------------------
 // One row per downloadable file; a master playlist contributes one row per quality.
@@ -175,29 +181,37 @@ function render() {
   if (!same) list.replaceChildren(...next);
 }
 
-function applyPage(p = {}) {
-  page = p;
+function applyPage(tab) {
+  page = tab ? { url: tab.url || '', title: tab.title || '' } : {};
   document.title = page.title || 'Video Downloader';
-  if (document.activeElement !== addr && page.url) addr.value = page.url;
+  if (!editing) addr.value = page.url || '';
+}
+
+const mediaKey = () => `tab:${trackedId}`;
+
+async function follow(tabId) {
+  trackedId = tabId ?? null;
+  const key = mediaKey();
+  const stored = await chrome.storage.session.get(key);
+  media = stored[key] || [];
+  applyPage(trackedId != null ? await chrome.tabs.get(trackedId).catch(() => null) : null);
+  render();
 }
 
 // ---- Startup --------------------------------------------------------------------------
 
-await send({ type: 'viewer-open' });
-
-const stored = await chrome.storage.session.get([mediaKey, pageKey, 'jobs']);
-media = stored[mediaKey] || [];
+const stored = await chrome.storage.session.get(['tracked', 'jobs']);
 jobs = stored.jobs || [];
-applyPage(stored[pageKey]);
-render();
+await follow(stored.tracked);
+if (!page.url) addr.focus();
 
 chrome.storage.session.onChanged.addListener((changes) => {
-  if (changes[pageKey]) applyPage(changes[pageKey].newValue);
-  if (changes[mediaKey]) media = changes[mediaKey].newValue || [];
+  if (changes.tracked) return void follow(changes.tracked.newValue);
+  if (changes[mediaKey()]) media = changes[mediaKey()].newValue || [];
   if (changes.jobs) jobs = changes.jobs.newValue || [];
-  if (changes[mediaKey] || changes.jobs) render();
+  if (changes[mediaKey()] || changes.jobs) render();
 });
 
-const initial = new URL(location.href).searchParams.get('url') || page.url;
-if (initial && normalize(initial)) load(normalize(initial));
-else addr.focus();
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (tabId === trackedId && (info.url || info.title)) applyPage(tab);
+});

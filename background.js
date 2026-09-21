@@ -3,13 +3,11 @@ import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
 
 // Everything lives in storage.session because the service worker can be torn down at any
 // moment and in-memory state would be lost with it:
-//   tab:<id>   media detected in a viewer tab
-//   page:<id>  { url, title } of the page shown in that viewer's frame
-//   viewers    { [tabId]: ruleId } open viewer tabs and their frame-header rule
+//   tab:<id>   media detected in that tab
+//   tracked    id of the browser tab the viewer window is following
 //   jobs       HLS download jobs
 const tabKey = (tabId) => `tab:${tabId}`;
-const pageKey = (tabId) => `page:${tabId}`;
-const VIEWERS = 'viewers';
+const TRACKED = 'tracked';
 const JOBS = 'jobs';
 const VIEWER_PAGE = 'viewer/viewer.html';
 
@@ -30,16 +28,6 @@ function update(key, fn) {
   return run;
 }
 
-// Only viewer tabs are watched; the cache is dropped with the worker and reloaded lazily.
-let viewersCache = null;
-
-async function getViewers() {
-  viewersCache ??= (await chrome.storage.session.get(VIEWERS))[VIEWERS] || {};
-  return viewersCache;
-}
-
-const isViewer = async (tabId) => String(tabId) in (await getViewers());
-
 // A variant or audio playlist already offered through its master is hidden behind it.
 function linkChildren(list) {
   const parents = new Map();
@@ -50,7 +38,6 @@ function linkChildren(list) {
 }
 
 async function addMedia(tabId, item) {
-  if (!(await isViewer(tabId))) return;
   let added = null;
   await update(tabKey(tabId), (list = []) => {
     const old = list.find((m) => m.url === item.url);
@@ -65,62 +52,46 @@ async function addMedia(tabId, item) {
   if (added?.kind === 'hls') probe(tabId, added);
 }
 
-// The viewer's frame committed a new document: start a fresh list for it.
-async function navigated(tabId, url) {
-  await update(pageKey(tabId), () => ({ url, title: '' }));
+// The tab's top frame committed a new document: start a fresh list for it.
+async function navigated(tabId) {
   await update(tabKey(tabId), () => []);
 }
 
-// ---- Viewer windows -------------------------------------------------------------------
+// ---- Viewer window --------------------------------------------------------------------
+// A standalone window listing the media of whichever normal browser tab is active, so the
+// page itself runs in a real tab (nothing to block) and the list never closes on a click.
 
-// Sites refuse to be framed via X-Frame-Options / CSP frame-ancestors; strip both, but only
-// for frames inside this viewer tab.
-async function registerViewer(tabId) {
-  const viewers = await getViewers();
-  const ruleId = viewers[tabId] ?? newRuleId();
-  await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [ruleId],
-    addRules: [
-      {
-        id: ruleId,
-        priority: 2,
-        action: {
-          type: 'modifyHeaders',
-          responseHeaders: [
-            { header: 'x-frame-options', operation: 'remove' },
-            { header: 'content-security-policy', operation: 'remove' },
-          ],
-        },
-        condition: { tabIds: [tabId], resourceTypes: ['sub_frame'] },
-      },
-    ],
-  });
-  viewersCache = await update(VIEWERS, (v = {}) => ({ ...v, [tabId]: ruleId }));
+async function viewerContext() {
+  const prefix = chrome.runtime.getURL(VIEWER_PAGE);
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['TAB'] });
+  return contexts.find((c) => c.documentUrl?.startsWith(prefix)) || null;
 }
 
-async function unregisterViewer(tabId) {
-  const viewers = await getViewers();
-  if (!(tabId in viewers)) return;
-  removeRule(viewers[tabId]);
-  viewersCache = await update(VIEWERS, (v = {}) => {
-    const { [tabId]: _, ...rest } = v;
-    return rest;
-  });
-  chrome.storage.session.remove([tabKey(tabId), pageKey(tabId)]);
-  chains.delete(tabKey(tabId));
-  chains.delete(pageKey(tabId));
+async function track(tabId) {
+  await chrome.storage.session.set({ [TRACKED]: tabId });
+}
+
+async function trackActiveIn(windowId) {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  const win = await chrome.windows.get(windowId, { populate: true }).catch(() => null);
+  if (win?.type !== 'normal') return;
+  const active = win.tabs.find((t) => t.active);
+  if (active) track(active.id);
 }
 
 async function openViewer(tab) {
-  const prefix = chrome.runtime.getURL(VIEWER_PAGE);
-  const contexts = await chrome.runtime.getContexts({ contextTypes: ['TAB'] });
-  const existing = contexts.find((c) => c.documentUrl?.startsWith(prefix));
+  if (tab?.id != null) await track(tab.id);
+  const existing = await viewerContext();
   if (existing) {
     await chrome.windows.update(existing.windowId, { focused: true });
     return;
   }
-  const start = /^https?:/i.test(tab?.url || '') ? `?url=${encodeURIComponent(tab.url)}` : '';
-  await chrome.windows.create({ url: prefix + start, type: 'popup', width: 1000, height: 820 });
+  await chrome.windows.create({
+    url: chrome.runtime.getURL(VIEWER_PAGE),
+    type: 'popup',
+    width: 620,
+    height: 460,
+  });
 }
 
 // ---- Referer rules --------------------------------------------------------------------
@@ -162,11 +133,11 @@ const removeRule = (ruleId) =>
 // whether the stream is downloadable at all.
 
 async function probe(tabId, item) {
-  const { [pageKey(tabId)]: page } = await chrome.storage.session.get(pageKey(tabId));
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
   const ruleId = newRuleId();
   let info;
   try {
-    await setRefererRule(ruleId, [new URL(item.url).hostname], page?.url);
+    await setRefererRule(ruleId, [new URL(item.url).hostname], tab?.url);
     const res = await fetch(item.url, { credentials: 'include' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const pl = parsePlaylist(await res.text(), res.url || item.url);
@@ -296,14 +267,17 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders'],
 );
 
-// The viewer page holds exactly one frame, so its documents are the ones whose parent is
-// the top frame.
-chrome.webNavigation.onCommitted.addListener(async (d) => {
-  if (d.parentFrameId !== 0 || !/^https?:/i.test(d.url) || !(await isViewer(d.tabId))) return;
-  navigated(d.tabId, d.url);
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId === 0) navigated(d.tabId);
 });
 
-chrome.tabs.onRemoved.addListener(unregisterViewer);
+chrome.tabs.onActivated.addListener(({ windowId }) => trackActiveIn(windowId));
+chrome.windows.onFocusChanged.addListener(trackActiveIn);
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove(tabKey(tabId));
+  chains.delete(tabKey(tabId));
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.target === 'offscreen') return;
@@ -329,17 +303,6 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     case 'cancel-job':
       cancelJob(msg.id);
       return;
-    case 'viewer-open':
-      registerViewer(sender.tab.id).then(() => reply(true), (e) => reply({ error: e.message }));
-      return true;
-    case 'page-title': {
-      const tabId = sender.tab?.id;
-      if (tabId == null) return;
-      isViewer(tabId).then((yes) => {
-        if (yes) update(pageKey(tabId), (p = {}) => ({ ...p, title: msg.title }));
-      });
-      return;
-    }
     case 'set-referer':
       setRefererRule(msg.ruleId, msg.hosts, msg.referer).then(
         () => reply(true),

@@ -49,21 +49,11 @@ body {
   color: var(--muted);
 }
 
-#frame {
-  flex: 1;
-  width: 100%;
-  min-height: 0;
-  border: 0;
-  background: #fff;
-}
-
 #media {
-  flex: none;
-  max-height: 32vh;
+  flex: 1;
   margin: 0;
   padding: 0;
   overflow-y: auto;
-  border-top: 1px solid var(--line);
   list-style: none;
 }
 
