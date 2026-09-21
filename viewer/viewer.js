@@ -138,13 +138,18 @@ function formatDuration(sec) {
 const queuedAt = new Map();
 
 function queueButton(key, start) {
-  if (Date.now() - (queuedAt.get(key) || 0) < 1500) return { text: '已加入', disabled: true };
+  const left = 1500 - (Date.now() - (queuedAt.get(key) || 0));
+  if (left > 0) {
+    // Whichever render shows the notice also takes it down; a row rebuilt later (after
+    // navigating back) would otherwise keep it until something else re-renders.
+    setTimeout(renderMedia, left + 50);
+    return { text: '已加入', disabled: true };
+  }
   return {
     text: '下載',
     onClick: async () => {
       queuedAt.set(key, Date.now());
       renderMedia();
-      setTimeout(renderMedia, 1600);
       const res = await start();
       if (res?.error) alert(res.error);
     },
