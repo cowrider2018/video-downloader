@@ -151,11 +151,20 @@
   // anonymous ones (Allow-Origin: *), never both; learn which per host from the first try.
   const hostMode = new Map();
 
-  // fetch() as the page, adding the custom headers the player itself sent.
+  // fetch() as the page, adding the custom headers the player itself sent. If those make
+  // the server refuse the CORS preflight, go without them.
   const pageFetch = (extraHeaders = {}) => async (url, init = {}) => {
     const host = new URL(url).host;
-    const go = (credentials) =>
-      fetch(url, { ...init, headers: { ...extraHeaders, ...init.headers }, credentials });
+    const plain = (credentials) => fetch(url, { ...init, credentials });
+    const go = async (credentials) => {
+      if (!Object.keys(extraHeaders).length) return plain(credentials);
+      try {
+        return await fetch(url, { ...init, headers: { ...extraHeaders, ...init.headers }, credentials });
+      } catch (e) {
+        if (init.signal?.aborted || !(e instanceof TypeError)) throw e;
+        return plain(credentials);
+      }
+    };
     const known = hostMode.get(host);
     if (known) return go(known);
     try {

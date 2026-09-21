@@ -13,6 +13,8 @@ const sent = [
   { name: 'Sec-Fetch-Mode', value: 'cors' },
   { name: 'User-Agent', value: 'UA' },
   { name: 'Accept', value: '*/*' },
+  { name: 'X-Client-Data', value: 'CIa2yQE=' },
+  { name: 'X-Browser-Channel', value: 'stable' },
 ];
 
 test('identityHeaders keeps identity and custom headers, drops transport ones', () => {
