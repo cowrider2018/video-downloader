@@ -1,3 +1,4 @@
+import { repLabel } from '../lib/dash.js';
 import { audioFor, variantLabel } from '../lib/hls.js';
 import { displayName, filenameFor, formatBytes } from '../lib/media.js';
 
@@ -194,8 +195,37 @@ function mseRow(m) {
   };
 }
 
+const rate = (bps) => (bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} Mbps` : `${Math.round(bps / 1000)} kbps`);
+
+function startDash(m, rep) {
+  const base = { type: 'download-dash', tabId: tab.id, mediaId: m.id, title: titleForFiles() };
+  const video = send({ ...base, repId: rep.id, tag: repLabel(rep) });
+  // A video representation carries no sound; fetch the best audio track alongside.
+  const audio = rep.kind === 'video' && m.reps.find((r) => r.kind === 'audio' && !r.protected);
+  if (audio) send({ ...base, repId: audio.id, tag: repLabel(audio) });
+  return video;
+}
+
+// One row per representation: each video quality (downloaded with the best audio track)
+// and each audio track on its own.
+function dashRows(m, name) {
+  const row = (key, meta, button) => ({ key, name, title: m.url, meta, buttons: [button] });
+  const off = (text, title) => ({ text, title, disabled: true });
+  if (!m.probed) return [row(m.url, ['DASH'], off('解析中'))];
+  if (m.error) return [row(m.url, ['DASH'], off('無法解析', m.error))];
+  if (m.live) return [row(m.url, ['DASH'], off('直播', '不支援直播串流'))];
+  return m.reps.map((r) =>
+    row(
+      `${m.url}#${r.id}`,
+      ['DASH', repLabel(r), rate(r.bandwidth), formatDuration(m.duration)],
+      r.protected ? off('受保護', '此串流受 DRM 保護') : queueButton(`${m.url}#${r.id}`, () => startDash(m, r)),
+    ),
+  );
+}
+
 function rowsFor(m) {
   if (m.kind === 'mse') return [mseRow(m)];
+  if (m.kind === 'dash') return dashRows(m, displayName(m.url));
   const name = displayName(m.url);
   const row = (key, meta, button) => ({ key, name, title: key, meta, buttons: [button] });
   const off = (text, title) => ({ text, title, disabled: true });
@@ -210,7 +240,7 @@ function rowsFor(m) {
     return m.variants.map((v) =>
       row(
         v.url,
-        ['HLS', variantLabel(v), v.bandwidth ? `${(v.bandwidth / 1e6).toFixed(1)} Mbps` : ''],
+        ['HLS', variantLabel(v), v.bandwidth ? rate(v.bandwidth) : ''],
         queueButton(v.url, () => startHls(m, v.url, variantLabel(v), audioFor(v, m.audio))),
       ),
     );

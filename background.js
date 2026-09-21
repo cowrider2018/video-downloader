@@ -1,4 +1,5 @@
 import { identityHeaders, pageHeaders } from './lib/headers.js';
+import { parseMpd, repExt } from './lib/dash.js';
 import { parsePlaylist } from './lib/hls.js';
 import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
 
@@ -75,7 +76,7 @@ async function addMedia(tabId, item) {
       );
     }
   });
-  if (added?.kind === 'hls') probe(tabId, added);
+  if (added?.kind === 'hls' || added?.kind === 'dash') probe(tabId, added);
 }
 
 async function findMedia(tabId, mediaId) {
@@ -258,6 +259,17 @@ async function askPage(tabId, frameId, msg, tries = 6) {
   }
 }
 
+function hlsInfo(text, url) {
+  const pl = parsePlaylist(text, url);
+  if (pl.type === 'master') return { variants: pl.variants, audio: pl.audio };
+  return { duration: pl.duration, segments: pl.segments.length, live: !pl.endList, encryption: pl.encryption };
+}
+
+function dashInfo(text, url) {
+  const { live, drm, duration, reps } = parseMpd(text, url);
+  return { live, drm, duration, reps };
+}
+
 async function probe(tabId, item) {
   let info;
   try {
@@ -267,16 +279,7 @@ async function probe(tabId, item) {
       headers: pageHeaders(item.headers),
     });
     if (res?.error) throw new Error(res.error);
-    const pl = parsePlaylist(res.text, item.url);
-    info =
-      pl.type === 'master'
-        ? { variants: pl.variants, audio: pl.audio }
-        : {
-            duration: pl.duration,
-            segments: pl.segments.length,
-            live: !pl.endList,
-            encryption: pl.encryption,
-          };
+    info = item.kind === 'dash' ? dashInfo(res.text, item.url) : hlsInfo(res.text, item.url);
   } catch (e) {
     info = { error: e.message };
   }
@@ -291,7 +294,8 @@ async function probe(tabId, item) {
 //           player's custom headers, but never the page's referer or origin);
 //   file    the same file fetched by the offscreen document with the page's full identity,
 //           used when the server refuses the native download;
-//   hls     a stream assembled by the offscreen document with the page's identity.
+//   hls     a stream assembled by the offscreen document with the page's identity;
+//   dash    one representation of a DASH stream, likewise.
 
 const patchJob = (id, patch) =>
   update(JOBS, (jobs = []) => jobs.map((j) => (j.id === id ? { ...j, ...patch } : j)));
@@ -328,7 +332,14 @@ async function runInOffscreen(job, item) {
   await ensureOffscreen();
   toOffscreen({
     type: 'job-start',
-    job: { id: job.id, kind: job.kind, url: job.url, ext: item.ext, headers: pageHeaders(item.headers) },
+    job: {
+      id: job.id,
+      kind: job.kind,
+      url: job.url,
+      repId: job.repId,
+      ext: item.ext,
+      headers: pageHeaders(item.headers),
+    },
   });
 }
 
@@ -370,6 +381,24 @@ async function startHls({ tabId, mediaId, url, title, tag }) {
   await runInOffscreen(job, item);
 }
 
+async function startDash({ tabId, mediaId, repId, title, tag }) {
+  const item = await findMedia(tabId, mediaId);
+  if (!item) throw new Error('找不到這個串流，頁面可能已經換頁');
+  const rep = item.reps?.find((r) => r.id === repId);
+  if (!rep) throw new Error('找不到這個畫質');
+  const job = await newJob({
+    kind: 'dash',
+    tabId,
+    url: item.url,
+    repId,
+    title,
+    tag,
+    filename: filenameFor(title, repExt(rep), tag),
+    identity: await snapshotIdentity(tabId, item),
+  });
+  await runInOffscreen(job, item);
+}
+
 // A native download the server refused: fetch it again with the page's identity.
 async function retryAsPage(job) {
   const item = job.item;
@@ -381,7 +410,7 @@ async function onJobReady({ id, blobUrl, ext, size }) {
   const job = await findJob((j) => j.id === id);
   // Deleted while it was finishing: just let go of the blob.
   if (!job) return void toOffscreen({ type: 'release', id });
-  const filename = job.kind === 'hls' ? filenameFor(job.title, ext, job.tag) : job.filename;
+  const filename = job.kind === 'hls' || job.kind === 'dash' ? filenameFor(job.title, ext, job.tag) : job.filename;
   await patchJob(id, { status: 'saving', filename, bytes: size, done: job.total || size, total: job.total || size });
   try {
     const downloadId = await chrome.downloads.download({ url: blobUrl, filename, conflictAction: 'uniquify' });
@@ -571,6 +600,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return;
     case 'download':
       downloadFile(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
+      return true;
+    case 'download-dash':
+      startDash(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
     case 'download-hls':
       startHls(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));

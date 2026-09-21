@@ -49,6 +49,7 @@
   "web_accessible_resources": [
     {
       "resources": [
+        "lib/dash.js",
         "lib/hls.js",
         "lib/jobs.js"
       ],

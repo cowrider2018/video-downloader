@@ -2,7 +2,7 @@
 // carry the page's identity through header rules the service worker installs per host
 // (see installIdentity); the finished blob: URL goes back to the worker, which cannot
 // create blob URLs itself.
-import { fetchFile, makeFetchBytes, makeGate, runHlsJob } from '../lib/jobs.js';
+import { fetchFile, makeFetchBytes, makeGate, runDashJob, runHlsJob } from '../lib/jobs.js';
 
 const running = new Map(); // job id -> { controller, gate, cancelled, blobUrl }
 
@@ -64,7 +64,9 @@ async function run(job) {
       blob = await fetchFile(job.url, { fetchImpl, signal, onProgress, gate });
     } else {
       const fetchBytes = makeFetchBytes({ signal, fetchImpl });
-      ({ blob, ext } = await runHlsJob(job.url, { fetchBytes, signal, onProgress, beforeFetch, gate }));
+      const options = { fetchBytes, signal, onProgress, beforeFetch, gate };
+      ({ blob, ext } =
+        job.kind === 'dash' ? await runDashJob(job.url, job.repId, options) : await runHlsJob(job.url, options));
     }
     state.blobUrl = URL.createObjectURL(blob);
     post({ type: 'job-ready', id: job.id, blobUrl: state.blobUrl, ext, size: blob.size });

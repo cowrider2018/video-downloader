@@ -15,6 +15,11 @@ test('classify detects HLS playlists regardless of size', () => {
   assert.deepEqual(classify('https://a.com/pl', 'application/vnd.apple.mpegurl', 300), { kind: 'hls', ext: 'm3u8' });
 });
 
+test('classify detects DASH manifests', () => {
+  assert.deepEqual(classify('https://a.com/v/manifest.mpd?t=1', 'text/xml', 900), { kind: 'dash', ext: 'mpd' });
+  assert.deepEqual(classify('https://a.com/v/stream', 'application/dash+xml', 900), { kind: 'dash', ext: 'mpd' });
+});
+
 test('classify rejects segments, small files and non-media', () => {
   assert.equal(classify('https://a.com/seg1.ts', 'video/mp2t', 5 * MB), null);
   assert.equal(classify('https://a.com/chunk-3.m4s', 'video/mp4', 5 * MB), null);
