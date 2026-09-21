@@ -1,6 +1,6 @@
 import { identityHeaders, pageHeaders } from './lib/headers.js';
-import { parseMpd, repExt } from './lib/dash.js';
-import { parsePlaylist } from './lib/hls.js';
+import { parseMpd, repExt, repLabel } from './lib/dash.js';
+import { audioFor, parsePlaylist, variantLabel } from './lib/hls.js';
 import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
 
 // Everything lives in storage.session because the service worker can be torn down at any
@@ -97,10 +97,10 @@ async function findMedia(tabId, mediaId) {
 
 // A new page is showing (top frame, or the frame inside a viewer): start a fresh list.
 // Downloads are not tied to the page and keep running.
-async function navigated(tabId, url) {
+async function navigated(tabId, url, frameId) {
   await update(tabKey(tabId), () => []);
   // The new page may have reported its title before this (the two race): use it then.
-  if (url) await update(pageKey(tabId), (p = {}) => ({ url, title: p.early?.url === url ? p.early.title : '' }));
+  if (url) await update(pageKey(tabId), (p = {}) => ({ url, frameId, title: p.early?.url === url ? p.early.title : '' }));
   // An MSE capture lives in the page, unlike every other download.
   await update(JOBS, (jobs = []) =>
     jobs.some((j) => j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status))
@@ -380,7 +380,7 @@ async function runInOffscreen(job, item) {
   });
 }
 
-async function downloadFile({ tabId, mediaId, filename }) {
+async function downloadFile({ tabId, mediaId, filename }, extra = {}) {
   const item = await findMedia(tabId, mediaId);
   if (!item) throw new Error('找不到這個媒體，頁面可能已經換頁');
   const headers = Object.entries(pageHeaders(item.headers)).map(([name, value]) => ({ name, value }));
@@ -392,6 +392,7 @@ async function downloadFile({ tabId, mediaId, filename }) {
     ext: item.ext,
     item,
     identity: await snapshotIdentity(tabId, item),
+    ...extra,
   });
   const start = (h) => chrome.downloads.download({ url: item.url, filename, conflictAction: 'uniquify', headers: h });
   try {
@@ -399,11 +400,11 @@ async function downloadFile({ tabId, mediaId, filename }) {
     const downloadId = await start(headers).catch(() => start([]));
     await patchJob(job.id, { downloadId });
   } catch (e) {
-    await patchJob(job.id, { status: 'failed', error: e.message });
+    await failJob(job.id, e.message);
   }
 }
 
-async function startHls({ tabId, mediaId, url, title, tag }) {
+async function startHls({ tabId, mediaId, url, title, tag }, extra = {}) {
   const item = await findMedia(tabId, mediaId);
   if (!item) throw new Error('找不到這個串流，頁面可能已經換頁');
   const job = await newJob({
@@ -414,11 +415,13 @@ async function startHls({ tabId, mediaId, url, title, tag }) {
     tag,
     filename: filenameFor(title, 'ts', tag),
     identity: await snapshotIdentity(tabId, item),
+    ...extra,
   });
   await runInOffscreen(job, item);
+  return job;
 }
 
-async function startDash({ tabId, mediaId, repId, title, tag }) {
+async function startDash({ tabId, mediaId, repId, title, tag }, extra = {}) {
   const item = await findMedia(tabId, mediaId);
   if (!item) throw new Error('找不到這個串流，頁面可能已經換頁');
   const rep = item.reps?.find((r) => r.id === repId);
@@ -432,8 +435,10 @@ async function startDash({ tabId, mediaId, repId, title, tag }) {
     tag,
     filename: filenameFor(title, repExt(rep), tag),
     identity: await snapshotIdentity(tabId, item),
+    ...extra,
   });
   await runInOffscreen(job, item);
+  return job;
 }
 
 // ---- MSE captures -------------------------------------------------------------------
@@ -458,12 +463,127 @@ async function startMse({ tabId, mediaId, title }) {
   toPage(job, { type: 'mse-capture', source: item.source });
 }
 
+// A capture of whichever player the page has (the busiest, or the first video, started
+// muted). `fields` carry on an automatic download's record.
+async function captureAny(tabId, title, fields) {
+  const { [tabKey(tabId)]: list = [], [pageKey(tabId)]: page = {} } = await chrome.storage.session.get([tabKey(tabId), pageKey(tabId)]);
+  const players = list.filter((m) => m.kind === 'mse').sort((a, b) => (b.size || 0) - (a.size || 0));
+  const job = {
+    kind: 'mse',
+    tabId,
+    frameId: players[0]?.frameId ?? page.frameId ?? 0,
+    source: players[0]?.source ?? null,
+    title,
+    filename: filenameFor(title, 'mp4'),
+    ...fields,
+  };
+  let saved;
+  if (fields.id) {
+    await patchJob(fields.id, job);
+    saved = await findJob((j) => j.id === fields.id);
+  } else {
+    saved = await newJob(job);
+  }
+  toPage(saved, { type: 'mse-capture', source: saved.source });
+}
+
+// ---- Automatic mode -----------------------------------------------------------------
+// Fastest first: what the network showed (the best HLS/DASH quality, else the largest
+// file), then an MSE capture of the page's player if that is missing or fails. One queue
+// row follows whichever method is running.
+
+function bestNetworkMedia(list) {
+  const shown = list.filter((m) => !m.parent && m.probed !== false && !m.error);
+  const streams = [];
+  for (const m of shown) {
+    if (m.kind === 'hls' && m.probed) {
+      const v = m.variants?.[0];
+      if (v) streams.push({ height: v.height || 0, start: (extra) => startHlsWithAudio(m, v, extra) });
+      else if (!m.live && (!m.encryption || m.encryption === 'AES-128')) {
+        streams.push({ height: 0, start: (extra) => startHls({ tabId: extra.tabId, mediaId: m.id, url: m.url, title: extra.title, tag: '' }, extra.fields) });
+      }
+    } else if (m.kind === 'dash' && m.probed && !m.live) {
+      const video = m.reps.find((r) => r.kind === 'video' && !r.protected);
+      const audio = m.reps.find((r) => r.kind === 'audio' && !r.protected);
+      const main = video || audio;
+      if (main) streams.push({ height: video?.height || 0, start: (extra) => startDashWithAudio(m, main, video && audio, extra) });
+    }
+  }
+  streams.sort((a, b) => b.height - a.height);
+  if (streams.length) return { method: '串流', start: streams[0].start };
+  // A page playing through MSE assembles its video from pieces; the .mp4 files it fetched are
+  // those pieces, not the video. Leave it to the capture.
+  if (list.some((m) => m.kind === 'mse')) return null;
+  const file = shown.filter((m) => m.kind === 'file').sort((a, b) => (b.size || 0) - (a.size || 0))[0];
+  if (!file) return null;
+  return {
+    method: '檔案',
+    start: (extra) => downloadFile({ tabId: extra.tabId, mediaId: file.id, filename: filenameFor(extra.title, file.ext) }, extra.fields),
+  };
+}
+
+// A video playlist and, when its sound is separate, the audio alongside: a companion job
+// that goes away if the video falls back to a capture (which has the sound).
+async function startHlsWithAudio(m, v, { tabId, title, fields }) {
+  const audio = audioFor(v, m.audio);
+  const job = await startHls({ tabId, mediaId: m.id, url: v.url, title, tag: variantLabel(v) }, fields);
+  if (audio) {
+    const tag = `音訊${audio.language ? ` ${audio.language}` : ''}`;
+    await startHls({ tabId, mediaId: m.id, url: audio.url, title, tag }, { companionOf: job.id });
+  }
+}
+
+async function startDashWithAudio(m, main, audio, { tabId, title, fields }) {
+  const job = await startDash({ tabId, mediaId: m.id, repId: main.id, title, tag: repLabel(main) }, fields);
+  if (audio) await startDash({ tabId, mediaId: m.id, repId: audio.id, title, tag: repLabel(audio) }, { companionOf: job.id });
+}
+
+async function startAuto({ tabId, title }) {
+  const { [tabKey(tabId)]: list = [] } = await chrome.storage.session.get(tabKey(tabId));
+  const network = bestNetworkMedia(list);
+  if (!network) return captureAny(tabId, title, { auto: [], method: '緩存' });
+  await network.start({ tabId, title, fields: { auto: ['mse'], method: network.method } });
+}
+
+// A failed download of an automatic job moves on to the next method, in the same row.
+async function failJob(id, error) {
+  const job = await findJob((j) => j.id === id);
+  if (!job) return;
+  if (!job.auto?.length) {
+    await patchJob(id, { status: 'failed', error });
+    return;
+  }
+  finishJob(job);
+  const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
+  for (const companion of jobs.filter((j) => j.companionOf === id)) deleteJob(companion.id);
+  const [next, ...rest] = job.auto;
+  if (next === 'mse') {
+    await captureAny(job.tabId, job.title, {
+      id,
+      status: 'running',
+      auto: rest,
+      method: '緩存',
+      done: 0,
+      total: 0,
+      bytes: 0,
+      downloadId: null,
+      rules: null,
+      error: null,
+      tried: [...(job.tried || []), `${job.method}：${error}`],
+    });
+  }
+}
+
 // Saves the assembled files. Replies with the ones the downloads API refused, for the page
 // to save itself.
 async function onMseReady({ id, files }) {
   const job = await findJob((j) => j.id === id);
   if (!job) return {};
-  const named = files.map((f) => ({ ...f, filename: filenameFor(job.title, f.ext, f.label) }));
+  // Started before the page had reported its title (named after the host)? It has one by now.
+  const { [pageKey(job.tabId)]: page = {} } = await chrome.storage.session.get(pageKey(job.tabId));
+  const host = /^https?:/.test(page.url || '') ? new URL(page.url).hostname : '';
+  const title = job.title === host && page.title ? page.title : job.title;
+  const named = files.map((f) => ({ ...f, filename: filenameFor(title, f.ext, f.label) }));
   await patchJob(id, {
     status: 'saving',
     filename: named[0].filename,
@@ -526,8 +646,16 @@ async function finishJob(job) {
 
 async function onJobFailed({ id, cancelled, error }) {
   const job = await findJob((j) => j.id === id);
-  await patchJob(id, cancelled ? { status: 'cancelled' } : { status: 'failed', error });
-  if (job) finishJob(job);
+  if (!job) return;
+  if (cancelled) {
+    await patchJob(id, { status: 'cancelled' });
+    finishJob(job);
+  } else if (job.auto?.length) {
+    await failJob(id, error);
+  } else {
+    await patchJob(id, { status: 'failed', error });
+    finishJob(job);
+  }
 }
 
 // Pausing keeps what has been downloaded; resuming carries on from there.
@@ -592,10 +720,11 @@ chrome.downloads.onChanged.addListener(async (delta) => {
     await patchJob(job.id, { status: 'done' });
   } else if (job.kind === 'native' && /^SERVER_/.test(delta.error?.current || '')) {
     chrome.downloads.erase({ id: delta.id }).catch(() => {});
-    retryAsPage(job).catch((e) => patchJob(job.id, { status: 'failed', error: e.message }));
+    retryAsPage(job).catch((e) => failJob(job.id, e.message));
     return;
   } else {
-    await patchJob(job.id, { status: 'failed', error: delta.error?.current || '存檔被中斷' });
+    await failJob(job.id, delta.error?.current || '存檔被中斷');
+    return;
   }
   if (job.kind !== 'native') finishJob(job);
 });
@@ -643,7 +772,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webNavigation.onCommitted.addListener(async (d) => {
   const viewer = await isViewer(d.tabId);
   if (d.frameId === 0 && !viewer) navigated(d.tabId);
-  else if (viewer && d.parentFrameId === 0 && /^https?:/i.test(d.url)) navigated(d.tabId, d.url);
+  else if (viewer && d.parentFrameId === 0 && /^https?:/i.test(d.url)) navigated(d.tabId, d.url, d.frameId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -698,6 +827,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       }
       return;
     }
+    case 'download-auto':
+      startAuto(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
+      return true;
     case 'download-mse':
       startMse(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
