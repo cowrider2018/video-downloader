@@ -74,19 +74,20 @@ function formatDuration(sec) {
   return hh ? `${hh}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
 }
 
-async function startHls(url, tag, audio) {
-  const base = { type: 'download-hls', title: titleForFiles(), referer: page.url };
+async function startHls(m, url, tag, audio) {
+  const base = { type: 'download-hls', tabId: trackedId, mediaId: m.id, title: titleForFiles() };
   await send({ ...base, url, tag });
   if (audio) await send({ ...base, url: audio.url, tag: `音訊${audio.language ? ` ${audio.language}` : ''}` });
 }
 
-// Button state for an HLS row follows its most recent job.
-function hlsButton(url, start) {
+// Button state for a row with a download job (HLS, or a file fetched in the page) follows
+// its most recent job.
+function jobButton(url, start) {
   const job = jobFor(url);
   switch (job?.status) {
     case 'running': {
-      const pct = job.total ? Math.floor((job.done / job.total) * 100) : 0;
-      return { text: `${pct}%`, title: '點擊取消', onClick: () => send({ type: 'cancel-job', id: job.id }) };
+      const text = job.total ? `${Math.floor((job.done / job.total) * 100)}%` : formatBytes(job.bytes) || '0%';
+      return { text, title: '點擊取消', onClick: () => send({ type: 'cancel-job', id: job.id }) };
     }
     case 'saving':
       return { text: '存檔中', disabled: true };
@@ -100,16 +101,22 @@ function hlsButton(url, start) {
 }
 
 function fileButton(m) {
+  // The server refused the plain download and the page is fetching it instead.
+  if (jobFor(m.url)) return jobButton(m.url, () => fileStart(m));
   const id = fileDownloads.get(m.url);
   if (id != null) return { text: '顯示', onClick: () => chrome.downloads.show(id) };
-  return {
-    text: '下載',
-    onClick: async () => {
-      const res = await send({ type: 'download', url: m.url, filename: filenameFor(titleForFiles(), m.ext) });
-      if (res?.id != null) fileDownloads.set(m.url, res.id);
-      render();
-    },
-  };
+  return { text: '下載', onClick: () => fileStart(m) };
+}
+
+async function fileStart(m) {
+  const res = await send({
+    type: 'download',
+    tabId: trackedId,
+    mediaId: m.id,
+    filename: filenameFor(titleForFiles(), m.ext),
+  });
+  if (res?.id != null) fileDownloads.set(m.url, res.id);
+  render();
 }
 
 // MSE captures are saved by the page itself, so there is no download id to track; the
@@ -170,7 +177,7 @@ function rowsFor(m) {
       name,
       title: v.url,
       meta: ['HLS', variantLabel(v), v.bandwidth ? `${(v.bandwidth / 1e6).toFixed(1)} Mbps` : ''],
-      button: hlsButton(v.url, () => startHls(v.url, variantLabel(v), audioFor(v, m.audio))),
+      button: jobButton(v.url, () => startHls(m, v.url, variantLabel(v), audioFor(v, m.audio))),
     }));
   }
   const meta = ['HLS', formatDuration(m.duration)];
@@ -178,7 +185,7 @@ function rowsFor(m) {
   if (m.encryption && m.encryption !== 'AES-128') {
     return [{ key: m.url, name, title: m.url, meta, button: off('受保護', `${m.encryption} 加密不支援`) }];
   }
-  return [{ key: m.url, name, title: m.url, meta, button: hlsButton(m.url, () => startHls(m.url, '', null)) }];
+  return [{ key: m.url, name, title: m.url, meta, button: jobButton(m.url, () => startHls(m, m.url, '', null)) }];
 }
 
 // Rows are reused by key, so a progress update never swaps a button out from under the cursor.

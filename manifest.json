@@ -1,16 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Video Downloader",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Video Downloader",
   "permissions": [
     "webRequest",
     "webNavigation",
     "downloads",
     "storage",
-    "scripting",
-    "offscreen",
-    "declarativeNetRequestWithHostAccess"
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -29,7 +27,7 @@
         "content.js"
       ],
       "all_frames": true,
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "action": {
@@ -45,5 +43,17 @@
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "lib/hls.js",
+        "lib/hls-job.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
+    }
+  ]
 }
