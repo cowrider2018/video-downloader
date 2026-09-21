@@ -1,25 +1,40 @@
 # Video Downloader
 
-Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS 串流，一鍵下載。功能參考 Video DownloadHelper 與貓抓（cat-catch）。
+Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS／DASH 串流並下載。功能參考 Video DownloadHelper 與貓抓（cat-catch）。
 
 ## 使用方式
 
 點工具列圖示會開啟一個獨立小視窗（已開啟則切換過去），由上到下：
 
-1. **網址列**：貼上網址按 Enter；開啟時會自動載入目前分頁的網址，站內換頁時會跟著更新。
+1. **網址列**：貼上網址按 Enter。開啟時會自動載入目前分頁的網址，站內換頁時會跟著更新。
 2. **網頁**：網站直接嵌在小視窗裡執行，不需要另開一般分頁。
-3. **媒體清單**：一列一個檔案，右側按鈕加入下載；HLS 的每種畫質各佔一列。
-4. **下載中**：所有加入的下載排在這裡，各自顯示進度。「暫停」保留已下載的部分，之後可「繼續」接著下載；「×」取消並從清單刪除（已完成的項目只移除清單，檔案保留）。下載在背景進行，加入後可以直接換頁、再開別的網頁繼續加入。
+3. **媒體清單**：一列一個可下載的項目，右側按鈕加入下載。HLS／DASH 的每種畫質各佔一列；DASH 的音軌也各自一列。
+4. **下載中**：所有加入的下載排在這裡，各自顯示進度。
+   - 「暫停」保留已下載的部分，之後按「繼續」接著下載。
+   - 「×」取消並從清單刪除；已完成的項目只移除清單，檔案保留在磁碟上。
+   - 下載在背景進行，加入後可以直接換頁、再開別的網頁繼續加入。
 
-## 功能
+媒體清單與下載中區塊的高度剛好容納目前的列數；調整視窗大小只會改變網頁區，網頁區可以縮到完全隱藏。
 
-- **自動偵測**：監看網路回應（`video/*`、`audio/*`、`.mp4`／`.webm`／`.m3u8` 等），並掃描頁面中的 `<video>`／`<audio>`。
-- **MSE 緩存捕捉**：小視窗開著時，攔截播放器餵給 MediaSource 的資料，讓以 `blob:` 播放、網路上沒有完整檔案的影片也能存下來（影像與音訊各一列）。單一頁面上限 2 GB。
-- **直接下載**：一般影音檔交給 Chrome 下載管理員，檔名取自頁面標題。
-- **HLS 串流**：解析 master playlist 列出所有畫質，平行下載片段、支援 AES-128 解密與 byte-range，合併成單一 `.ts`（fMP4 串流則為 `.mp4`）。音訊獨立的串流會另存一個音訊檔。
-- **可內嵌任意網站**：僅對小視窗內的框架移除 `X-Frame-Options` 與 `Content-Security-Policy` 標頭；Chrome 將擴充視窗中的網站視為第一方，Cookie（含 SameSite）照常運作。
-- **以網頁身分下載**：記錄網頁對每個主機送出的 Cookie、Referer、Origin 與播放器自訂標頭（如 Authorization），加入下載時存成快照，由背景以 `declarativeNetRequest` 原樣帶上。一般檔案先交給 Chrome 下載（串流寫入磁碟）；若伺服器拒絕，會自動改由背景以網頁身分重抓。
-- 過濾串流片段（`.ts`、`.m4s`）與小於 512 KB 的檔案（多半是預覽或廣告）。
+## 支援的格式
+
+| 格式 | 偵測方式 | 下載結果 |
+| --- | --- | --- |
+| 一般影音檔（mp4、webm、mp3…） | 網路回應的 `video/*`、`audio/*` 或副檔名；頁面中的 `<video>`／`<audio>` | 原檔 |
+| HLS（`.m3u8`） | 副檔名或 `mpegurl` MIME | 單一 `.ts`；fMP4 串流為 `.mp4`。支援 AES-128 解密與 byte-range |
+| DASH（`.mpd`） | 副檔名或 `application/dash+xml` | 每個 representation 一個檔案（`.mp4`／`.webm`／`.m4a`）。支援 SegmentTemplate（`$Number$`／`$Time$`、SegmentTimeline）、SegmentList、SegmentBase |
+| MSE 緩存（`blob:` 播放的影片） | 小視窗開著時，攔截播放器餵給 MediaSource 的資料 | 影像、音訊各一個檔案 |
+
+串流片段（`.ts`、`.m4s`）與小於 512 KB 的檔案（多半是預覽或廣告）不會列出。
+
+## 以網頁身分下載
+
+許多網站只把影片交給「自己的網頁」：檢查 Cookie（含 SameSite）、Referer、Origin，或播放器加上的 `Authorization` 等自訂標頭。
+
+- 小視窗內嵌的網站被 Chrome 視為第一方，Cookie 照常運作；只對小視窗內的框架移除 `X-Frame-Options` 與 `Content-Security-Policy`，讓網站可以被內嵌。
+- 記錄網頁對每個主機送出的請求標頭；加入下載時存成快照，由背景下載器以 `declarativeNetRequest` 原樣帶上，所以之後換頁也不影響。
+- 播放清單的解析由網頁本身的 content script 以網頁身分進行。
+- 一般檔案先交給 Chrome 下載（直接寫入磁碟，帶 Cookie 與自訂標頭）；Chrome 下載無法帶 Referer，若伺服器因此拒絕，會自動改由背景以網頁身分重抓，並支援以 Range 從中斷處續傳。
 
 ## 安裝
 
@@ -28,25 +43,27 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 
 ## 限制
 
-- 不支援 DRM／SAMPLE-AES 加密內容與直播串流。
-- 不支援 DASH（`.mpd`）清單解析；以 MediaSource 播放的影片請改用 MSE 緩存捕捉。
-- MSE 緩存捕捉只存下實際播放過的部分：請從頭播到尾、不要跳轉。影像與音訊為分開的檔案。
-- MSE 檔案由頁面自己觸發下載，第一次存多個檔案時 Chrome 可能會詢問是否允許此網站下載多個檔案。
-- HLS 合併與背景重抓都在記憶體中進行，非常大的影片會佔用相當記憶體。
+- 不支援 DRM（Widevine、PlayReady、FairPlay）保護的內容：金鑰只存在瀏覽器的解密模組中，擴充功能無法取得；受保護的畫質會顯示「受保護」並停用。HLS 的 SAMPLE-AES 同樣不支援。
+- 不支援直播串流（HLS 沒有 `#EXT-X-ENDLIST`、DASH 的 `type="dynamic"`）。
+- DASH 只處理第一個 Period。
+- 影像與音訊分開的串流（多數 DASH、部分 HLS、MSE 緩存）會存成兩個檔案，需自行以 ffmpeg 等工具合併。
+- HLS／DASH 合併與背景重抓都在記憶體中進行，非常大的影片會佔用相當記憶體。
+- MSE 緩存捕捉只存下實際播放過的部分：請從頭播到尾、不要跳轉；資料只存在於網頁中，存檔前請勿離開該頁面。第一次存多個檔案時，Chrome 可能會詢問是否允許此網站下載多個檔案。
 - 少數網站會以程式偵測自己被內嵌而拒絕運作（例如部分登入或機器人驗證頁），這類網站無法在小視窗中使用。
-- MSE 緩存資料只存在於網頁中，存檔前請勿離開該頁面。
-- 影像與音訊分開的串流會存成兩個檔案，需自行以 ffmpeg 等工具合併。
 
 ## 架構
 
 | 檔案 | 角色 |
 | --- | --- |
-| `background.js` | Service worker：開啟視窗、框架標頭規則、偵測媒體與請求身分、下載佇列（`storage.session`）、HLS 解析預覽、下載工作管理、Referer 規則 |
-| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源與頁面標題；轉接 MSE 攔截腳本；以網頁身分解析播放清單 |
-| `offscreen/` | 背景下載器：以網頁身分抓取 HLS 片段或整個檔案並組成 Blob |
+| `background.js` | Service worker：開啟小視窗與框架標頭規則、偵測媒體、記錄請求身分、播放清單解析預覽、下載佇列（`storage.session`）與身分規則 |
+| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源與頁面標題；轉接 MSE 攔截腳本；以網頁身分抓取播放清單 |
 | `inject/mse-hook.js` | 在頁面環境中攔截 `addSourceBuffer`／`appendBuffer`，保存緩衝資料 |
+| `offscreen/` | 背景下載器：以網頁身分抓取整檔、HLS 或 DASH 片段，可暫停，組成 Blob 後交給 Chrome 存檔 |
 | `viewer/` | 小視窗：網址列、內嵌網頁、媒體清單與下載中佇列 |
-| `lib/` | 共用模組：媒體分類與檔名、m3u8 解析、下載流程（整檔、分段串流、暫停）、身分標頭處理，皆有單元測試 |
+| `lib/media.js` | 媒體分類、大小、檔名 |
+| `lib/hls.js`、`lib/dash.js` | m3u8 與 MPD 解析（`dash.js` 內含精簡 XML 解析器，因為 service worker 沒有 `DOMParser`） |
+| `lib/jobs.js` | 下載流程：整檔（可續傳）、平行分段下載、暫停閘門、HLS 與 DASH 工作 |
+| `lib/headers.js` | 身分標頭的擷取與過濾 |
 
 ## 開發
 
