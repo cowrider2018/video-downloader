@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <title>Video Downloader</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <img src="../icons/icon32.png" alt="" width="20" height="20" />
+      <h1>Video Downloader</h1>
+    </header>
+
+    <section id="jobs" hidden>
+      <h2>下載工作</h2>
+      <ul id="job-list" class="list"></ul>
+    </section>
+
+    <main>
+      <ul id="media-list" class="list"></ul>
+      <div id="empty" class="empty" hidden>
+        <p>此頁面尚未偵測到影片。</p>
+        <p class="hint">開始播放影片後，它會出現在這裡。</p>
+      </div>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

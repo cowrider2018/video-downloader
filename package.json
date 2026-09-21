@@ -1,0 +1,11 @@
+{
+  "name": "vd-video-downloader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension that detects videos on web pages and downloads them.",
+  "scripts": {
+    "icons": "node tools/make-icons.js",
+    "test": "node --test"
+  }
+}
