@@ -23,7 +23,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 | 一般影音檔（mp4、webm、mp3…） | 網路回應的 `video/*`、`audio/*` 或副檔名；頁面中的 `<video>`／`<audio>` | 原檔 |
 | HLS（`.m3u8`） | 副檔名或 `mpegurl` MIME | 單一 `.ts`；fMP4 串流為 `.mp4`。支援 AES-128 解密與 byte-range |
 | DASH（`.mpd`） | 副檔名或 `application/dash+xml` | 每個 representation 一個檔案（`.mp4`／`.webm`／`.m4a`）。支援 SegmentTemplate（`$Number$`／`$Time$`、SegmentTimeline）、SegmentList、SegmentBase |
-| MSE 緩存（`blob:` 播放的影片） | 小視窗開著時，攔截播放器餵給 MediaSource 的資料；一個播放器一列 | 影像、音訊各一個檔案（`.mp4`／`.m4a`／`.webm`），含總長度，可拖曳 |
+| MSE 緩存（`blob:` 播放的影片） | 小視窗開著時，攔截播放器餵給 MediaSource 的資料；一個播放器一列 | fMP4 影像＋音訊合併為單一 `.mp4`（含總長度與索引，可拖曳）；WebM 等其他組合為各軌一個檔案 |
 
 串流片段（`.ts`、`.m4s`）與小於 512 KB 的檔案（多半是預覽或廣告）不會列出。
 
@@ -33,6 +33,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 
 - **加速**：按下載後，擴充功能讓播放器靜音暫停，並不斷把播放位置移到已緩衝範圍的末端；播放器暫停時仍會往前抓資料，因此以接近網路速度緩衝整部影片，而不是播放速度。不肯在暫停時抓資料的播放器，改以 16 倍速播放。實測 hls.js 播放 60 秒影片約 4–14 秒完成。
 - **重組**：播放器可能重複、亂序送出片段，也會中途切換畫質。依時間戳排序並去除重複；各時段採用現有最好的畫質，畫質之間的切換以 MP4 的多重樣本描述（WebM 則由 VP9／AV1 本身）處理，因此檔案完整且可播放。仍有缺口時，會再讓播放器補抓那些時段。
+- **合併**：影像與音訊都是 fMP4 時，在瀏覽器內直接合併成一個 MP4（兩條軌道、片段依時間交錯、附 `sidx` 索引），不需 ffmpeg。
 - 捕捉同樣列在「下載中」，可暫停、繼續、×。
 
 ## 以網頁身分下載
@@ -54,7 +55,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 - 不支援 DRM（Widevine、PlayReady、FairPlay）保護的內容：金鑰只存在瀏覽器的解密模組中，擴充功能無法取得；受保護的畫質會顯示「受保護」並停用。HLS 的 SAMPLE-AES 同樣不支援。
 - 不支援直播串流（HLS 沒有 `#EXT-X-ENDLIST`、DASH 的 `type="dynamic"`）。
 - DASH 只處理第一個 Period。
-- 影像與音訊分開的串流（多數 DASH、部分 HLS、MSE 緩存）會存成兩個檔案，需自行以 ffmpeg 等工具合併。
+- 影像與音訊分開的串流（多數 DASH、部分 HLS、WebM 的 MSE 緩存）會存成兩個檔案，需自行以 ffmpeg 等工具合併。
 - HLS／DASH 合併與背景重抓都在記憶體中進行，非常大的影片會佔用相當記憶體。
 - MSE 緩存捕捉的資料只存在於網頁中，完成前請勿離開該頁面；畫質取決於播放器當時的選擇。第一次存多個檔案時，Chrome 可能會詢問是否允許此網站下載多個檔案。
 - 少數網站會以程式偵測自己被內嵌而拒絕運作（例如部分登入或機器人驗證頁），這類網站無法在小視窗中使用。
@@ -72,7 +73,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 | `lib/hls.js`、`lib/dash.js` | m3u8 與 MPD 解析（`dash.js` 內含精簡 XML 解析器，因為 service worker 沒有 `DOMParser`） |
 | `lib/jobs.js` | 下載流程：整檔（可續傳）、平行分段下載、暫停閘門、HLS 與 DASH 工作 |
 | `lib/headers.js` | 身分標頭的擷取與過濾 |
-| `lib/fragments.js` | MSE 捕捉的重組：解析 fMP4／WebM 片段，排序、去重、跨畫質拼接、補上總長度 |
+| `lib/fragments.js` | MSE 捕捉的重組：解析 fMP4／WebM 片段，排序、去重、跨畫質拼接、補上總長度；fMP4 影像＋音訊合併與索引 |
 
 ## 開發
 

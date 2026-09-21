@@ -79,7 +79,7 @@
   async function finishCapture(job, done) {
     const { tracks } = done;
     try {
-      const { assembleTrack, gaps } = await import(chrome.runtime.getURL('lib/fragments.js'));
+      const { assembleTrack, gaps, indexedMp4, muxable, muxMp4 } = await import(chrome.runtime.getURL('lib/fragments.js'));
       const duration = Math.max(lengths.get(job) || 0, done.duration || 0);
       // Qualities the player switched between are combined; only stretches no quality has
       // (the player never buffered them) are walked again.
@@ -93,11 +93,22 @@
       }
       passes.delete(job);
       lengths.delete(job);
-      const files = built.map(({ t, a: { init, fragments } }) => {
-        const blob = new Blob([init, ...fragments], { type: t.mime.split(';')[0] });
-        const label = tracks.length > 1 ? (t.mime.startsWith('audio/') ? '音訊' : '影像') : '';
-        return { blobUrl: URL.createObjectURL(blob), ext: extOf(t.mime), label, size: blob.size };
-      });
+      // One fMP4 video and one fMP4 audio track become a single MP4; anything else is saved
+      // as one file per track.
+      const video = built.find(({ t }) => t.mime.startsWith('video/') && extOf(t.mime) === 'mp4');
+      const audio = built.find(({ t }) => t.mime.startsWith('audio/') && extOf(t.mime) === 'm4a');
+      let files;
+      if (built.length === 2 && video && audio && muxable(video.a, audio.a)) {
+        const blob = new Blob([muxMp4(video.a, audio.a)], { type: 'video/mp4' });
+        files = [{ blobUrl: URL.createObjectURL(blob), ext: 'mp4', label: '', size: blob.size }];
+      } else {
+        files = built.map(({ t, a }) => {
+          const bytes = extOf(t.mime) === 'mp4' || extOf(t.mime) === 'm4a' ? [indexedMp4(a)] : [a.init, ...a.fragments];
+          const blob = new Blob(bytes, { type: t.mime.split(';')[0] });
+          const label = tracks.length > 1 ? (t.mime.startsWith('audio/') ? '音訊' : '影像') : '';
+          return { blobUrl: URL.createObjectURL(blob), ext: extOf(t.mime), label, size: blob.size };
+        });
+      }
       captures.set(job, files.map((f) => f.blobUrl));
       const res = await send({ type: 'mse-ready', id: job, files });
       // The downloads API may refuse a blob: URL of the page's origin; save from the page then.

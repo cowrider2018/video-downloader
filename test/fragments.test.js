@@ -184,3 +184,56 @@ test('gaps: missing start, a hole in the middle, a missing end', () => {
   assert.deepEqual(gaps([0, 2, 4, 6, 8], 10), []);
   assert.deepEqual(gaps(null, 10), []);
 });
+
+// ---- muxing ----
+import { muxMp4, muxable } from '../lib/fragments.js';
+
+const fullInit = (tag, timescale) => [
+  box('ftyp', ascii('isom')),
+  box(
+    'moov',
+    box('mvhd', [0, 0, 0, 0], u32(0), u32(0), u32(1000), u32(0), new Array(76).fill(0), u32(2)),
+    box(
+      'trak',
+      box('tkhd', [0, 0, 0, 3], u32(0), u32(0), u32(1), u32(0), u32(0)),
+      box(
+        'mdia',
+        box('mdhd', [0, 0, 0, 0], u32(0), u32(0), u32(timescale), u32(0)),
+        box('minf', box('stbl', box('stsd', [0, 0, 0, 0], u32(1), box(tag === 'v' ? 'avc1' : 'mp4a', [1])))),
+      ),
+    ),
+    box('mvex', box('trex', [0, 0, 0, 0], u32(1), u32(1), u32(0), u32(0), u32(0))),
+  ),
+];
+
+test('mux: video and audio become tracks 1 and 2, fragments interleaved by time', () => {
+  const video = assembleTrack([cat(fullInit('v', 1000)), cat(frag(0, 1)), cat(frag(2000, 2)), cat(frag(4000, 3))], 'video/mp4');
+  const audio = assembleTrack([cat(fullInit('a', 48000)), cat(frag(0, 11)), cat(frag(96000, 12)), cat(frag(192000, 13))], 'audio/mp4');
+  assert.ok(muxable(video, audio));
+  const out = muxMp4(video, audio);
+  const top = mp4Boxes(out);
+  assert.deepEqual(top.slice(0, 2).map((b) => b.type), ['ftyp', 'moov']);
+  const moov = top[1];
+  const kids = [];
+  for (let i = moov.start + 8; i < moov.end; i += read32(out, i)) kids.push({ type: String.fromCharCode(...out.subarray(i + 4, i + 8)), start: i });
+  assert.deepEqual(kids.map((k) => k.type), ['mvhd', 'trak', 'trak', 'mvex']);
+  const mvhd = kids[0];
+  assert.equal(read32(out, mvhd.start + read32(out, mvhd.start) - 4), 3, 'next_track_ID');
+  const trakIds = kids.filter((k) => k.type === 'trak').map((k) => read32(out, k.start + 8 + 20));
+  assert.deepEqual(trakIds, [1, 2]);
+  const mvex = kids[3];
+  assert.deepEqual([read32(out, mvex.start + 8 + 12), read32(out, mvex.start + 8 + 32 + 12)], [1, 2], 'trex ids');
+  // fragments: v0 a0 v2 a2 v4 a4 (seconds), with track ids and sequence numbers rewritten
+  const moofs = top.filter((b) => b.type === 'moof');
+  const tfhdId = (m) => read32(out, m.start + 8 + 16 + 8 + 12);
+  const seq = (m) => read32(out, m.start + 8 + 12);
+  assert.deepEqual(moofs.map(tfhdId), [1, 2, 1, 2, 1, 2]);
+  assert.deepEqual(moofs.map(seq), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(mdatFills(out), [1, 11, 2, 12, 3, 13]);
+});
+
+test('mux: not for tracks without timestamps or init extends', () => {
+  const noMvex = assembleTrack([cat(init(1)), cat(frag(0, 1))], 'video/mp4');
+  const audio = assembleTrack([cat(fullInit('a', 1000)), cat(frag(0, 11))], 'audio/mp4');
+  assert.equal(muxable(noMvex, audio), false);
+});
