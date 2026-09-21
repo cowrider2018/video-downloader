@@ -1,6 +1,6 @@
 // Runs in every page and frame from document_start. It:
 //  1. reports <video>/<audio> sources (covers media served from cache);
-//  2. bridges inject/mse-hook.js, which lives in the page's world;
+//  2. bridges inject/mse-hook.js, which lives in the page's world, and assembles its captures;
 //  3. fetches playlists for probing *as the page*: same origin, cookies and referer as the
 //     player's own requests, so sites that check who is asking still answer;
 //  4. reports the title of the page framed in the viewer window.
@@ -49,10 +49,94 @@
 
   const TAG = '__vd_mse__';
 
+  const toHook = (cmd, extra) => window.postMessage({ [TAG]: cmd, ...extra }, '*');
+
+  // A capture job: the hook walks the player's buffer; its tracks come back here to be put
+  // in order (lib/fragments.js) and handed to the extension as files.
+  const captures = new Map(); // job id -> blob: URLs, released once saved
+  const passes = new Map(); // job id -> how many times the buffer has been walked
+  const lengths = new Map(); // job id -> longest duration the player has reported
+  const MAX_PASSES = 2;
+
+  const extOf = (mime) => {
+    const type = mime.split(';')[0].trim();
+    if (type === 'audio/mp4') return 'm4a';
+    if (type === 'audio/webm') return 'weba';
+    return type.endsWith('/webm') ? 'webm' : 'mp4';
+  };
+
+  // Overlapping [from, to] ranges joined, in order.
+  function merge(ranges) {
+    const out = [];
+    for (const [a, b] of [...ranges].sort((x, y) => x[0] - y[0])) {
+      const last = out[out.length - 1];
+      if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+      else out.push([a, b]);
+    }
+    return out;
+  }
+
+  async function finishCapture(job, done) {
+    const { tracks } = done;
+    try {
+      const { assembleTrack, gaps } = await import(chrome.runtime.getURL('lib/fragments.js'));
+      const duration = Math.max(lengths.get(job) || 0, done.duration || 0);
+      // Qualities the player switched between are combined; only stretches no quality has
+      // (the player never buffered them) are walked again.
+      const built = tracks.map((t) => ({ t, a: assembleTrack(t.chunks, t.mime) }));
+      const holes = merge(built.flatMap(({ a }) => gaps(a.starts, duration)));
+      const pass = passes.get(job) || 1;
+      if (holes.length && pass < MAX_PASSES) {
+        passes.set(job, pass + 1);
+        toHook('capture', { job, source: done.source, ranges: holes });
+        return;
+      }
+      passes.delete(job);
+      lengths.delete(job);
+      const files = built.map(({ t, a: { init, fragments } }) => {
+        const blob = new Blob([init, ...fragments], { type: t.mime.split(';')[0] });
+        const label = tracks.length > 1 ? (t.mime.startsWith('audio/') ? '音訊' : '影像') : '';
+        return { blobUrl: URL.createObjectURL(blob), ext: extOf(t.mime), label, size: blob.size };
+      });
+      captures.set(job, files.map((f) => f.blobUrl));
+      const res = await send({ type: 'mse-ready', id: job, files });
+      // The downloads API may refuse a blob: URL of the page's origin; save from the page then.
+      for (const a of res?.anchors || []) {
+        const link = document.createElement('a');
+        link.href = a.blobUrl;
+        link.download = a.filename;
+        link.style.display = 'none';
+        document.documentElement.appendChild(link);
+        link.click();
+        link.remove();
+      }
+    } catch (e) {
+      send({ type: 'job-failed', id: job, error: e.message });
+    }
+  }
+
   window.addEventListener('message', (e) => {
     if (e.source !== window || !e.data || typeof e.data !== 'object') return;
-    if (e.data[TAG] === 'streams' && Array.isArray(e.data.streams)) {
-      send({ type: 'mse-streams', streams: e.data.streams });
+    const d = e.data;
+    switch (d[TAG]) {
+      case 'streams':
+        if (Array.isArray(d.streams)) send({ type: 'mse-streams', streams: d.streams });
+        break;
+      case 'walk-progress': {
+        // Some players report a shorter duration for a while; keep the longest seen.
+        const duration = Math.max(lengths.get(d.job) || 0, d.duration || 0);
+        lengths.set(d.job, duration);
+        send({ type: 'job-progress', id: d.job, done: Math.round(d.at * 1000), total: Math.round(duration * 1000), bytes: 0 });
+        break;
+      }
+      case 'walk-done':
+        finishCapture(d.job, d);
+        break;
+      case 'walk-failed':
+        passes.delete(d.job);
+        lengths.delete(d.job);
+        send({ type: 'job-failed', id: d.job, error: d.error, cancelled: d.cancelled });
+        break;
     }
   });
 
@@ -87,8 +171,17 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     switch (msg.type) {
-      case 'mse-save':
-        window.postMessage({ [TAG]: 'save', id: msg.id, filename: msg.filename }, '*');
+      case 'mse-capture':
+        toHook('capture', { job: msg.id, source: msg.source });
+        return;
+      case 'mse-pause':
+      case 'mse-resume':
+      case 'mse-cancel':
+        toHook(`capture-${msg.type.slice(4)}`, { job: msg.id });
+        return;
+      case 'mse-release':
+        for (const url of captures.get(msg.id) || []) URL.revokeObjectURL(url);
+        captures.delete(msg.id);
         return;
       case 'fetch-text':
         lib()

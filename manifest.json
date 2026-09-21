@@ -50,6 +50,7 @@
     {
       "resources": [
         "lib/dash.js",
+        "lib/fragments.js",
         "lib/hls.js",
         "lib/jobs.js"
       ],

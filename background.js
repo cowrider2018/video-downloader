@@ -89,6 +89,16 @@ async function findMedia(tabId, mediaId) {
 async function navigated(tabId, url) {
   await update(tabKey(tabId), () => []);
   if (url) await update(pageKey(tabId), () => ({ url, title: '' }));
+  // An MSE capture lives in the page, unlike every other download.
+  await update(JOBS, (jobs = []) =>
+    jobs.some((j) => j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status))
+      ? jobs.map((j) =>
+          j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status)
+            ? { ...j, status: 'failed', error: '頁面已離開' }
+            : j,
+        )
+      : undefined,
+  );
 }
 
 // ---- Request identity -----------------------------------------------------------------
@@ -295,7 +305,8 @@ async function probe(tabId, item) {
 //   file    the same file fetched by the offscreen document with the page's full identity,
 //           used when the server refuses the native download;
 //   hls     a stream assembled by the offscreen document with the page's identity;
-//   dash    one representation of a DASH stream, likewise.
+//   dash    one representation of a DASH stream, likewise;
+//   mse     the page's own player buffering the whole video, captured in the page.
 
 const patchJob = (id, patch) =>
   update(JOBS, (jobs = []) => jobs.map((j) => (j.id === id ? { ...j, ...patch } : j)));
@@ -399,6 +410,61 @@ async function startDash({ tabId, mediaId, repId, title, tag }) {
   await runInOffscreen(job, item);
 }
 
+// ---- MSE captures -------------------------------------------------------------------
+// The page's own player buffers the whole video while the hook walks the playhead ahead
+// (inject/mse-hook.js); the content script assembles the tracks and hands back blob: URLs.
+
+const toPage = (job, msg) =>
+  chrome.tabs.sendMessage(job.tabId, { ...msg, id: job.id }, { frameId: job.frameId ?? 0 }).catch(() => {});
+
+async function startMse({ tabId, mediaId, title }) {
+  const item = await findMedia(tabId, mediaId);
+  if (!item) throw new Error('找不到這個媒體，頁面可能已經換頁');
+  const job = await newJob({
+    kind: 'mse',
+    tabId,
+    frameId: item.frameId ?? 0,
+    source: item.source,
+    url: item.url,
+    title,
+    filename: filenameFor(title, 'mp4'),
+  });
+  toPage(job, { type: 'mse-capture', source: item.source });
+}
+
+// Saves the assembled files. Replies with the ones the downloads API refused, for the page
+// to save itself.
+async function onMseReady({ id, files }) {
+  const job = await findJob((j) => j.id === id);
+  if (!job) return {};
+  const named = files.map((f) => ({ ...f, filename: filenameFor(job.title, f.ext, f.label) }));
+  await patchJob(id, {
+    status: 'saving',
+    filename: named[0].filename,
+    bytes: named.reduce((n, f) => n + f.size, 0),
+    blobUrls: named.map((f) => f.blobUrl),
+  });
+  const anchors = [];
+  let downloadId = null;
+  for (const f of named) {
+    try {
+      const d = await chrome.downloads.download({ url: f.blobUrl, filename: f.filename, conflictAction: 'uniquify' });
+      downloadId ??= d;
+    } catch {
+      anchors.push(f);
+    }
+  }
+  if (downloadId != null) await patchJob(id, { downloadId });
+  return { anchors };
+}
+
+// Downloads the page started itself are matched to their capture by URL.
+chrome.downloads.onCreated.addListener(async (item) => {
+  if (!item.url.startsWith('blob:')) return;
+  const job = await findJob((j) => j.blobUrls?.includes(item.url) && j.downloadId == null);
+  if (job) patchJob(job.id, { downloadId: item.id });
+});
+
 // A native download the server refused: fetch it again with the page's identity.
 async function retryAsPage(job) {
   const item = job.item;
@@ -425,9 +491,10 @@ async function onJobReady({ id, blobUrl, ext, size }) {
 async function finishJob(job) {
   const latest = (await findJob((j) => j.id === job.id)) || job;
   removeRules(Object.values(latest.rules || {}));
-  toOffscreen({ type: 'release', id: job.id });
+  if (job.kind === 'mse') toPage(job, { type: 'mse-release' });
+  else toOffscreen({ type: 'release', id: job.id });
   const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
-  const busy = jobs.some((j) => j.kind !== 'native' && ['running', 'paused', 'saving'].includes(j.status));
+  const busy = jobs.some((j) => ['file', 'hls', 'dash'].includes(j.kind) && ['running', 'paused', 'saving'].includes(j.status));
   if (!busy) chrome.offscreen.closeDocument().catch(() => {});
 }
 
@@ -444,6 +511,8 @@ async function pauseJob(id) {
   await patchJob(id, { status: 'paused' });
   if (job.kind === 'native') {
     if (job.downloadId != null) chrome.downloads.pause(job.downloadId).catch(() => {});
+  } else if (job.kind === 'mse') {
+    toPage(job, { type: 'mse-pause' });
   } else {
     toOffscreen({ type: 'pause', id });
   }
@@ -455,6 +524,8 @@ async function resumeJob(id) {
   await patchJob(id, { status: 'running' });
   if (job.kind === 'native') {
     if (job.downloadId != null) chrome.downloads.resume(job.downloadId).catch(() => {});
+  } else if (job.kind === 'mse') {
+    toPage(job, { type: 'mse-resume' });
   } else {
     toOffscreen({ type: 'resume', id });
   }
@@ -472,7 +543,10 @@ async function deleteJob(id) {
     await chrome.downloads.cancel(job.downloadId).catch(() => {});
     chrome.downloads.erase({ id: job.downloadId }).catch(() => {});
   }
-  if (job.kind !== 'native') {
+  if (job.kind === 'mse') {
+    toPage(job, { type: 'mse-cancel' });
+    finishJob(job);
+  } else if (job.kind !== 'native') {
     toOffscreen({ type: 'cancel', id });
     finishJob(job);
   }
@@ -589,15 +663,17 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
           truncated: !!st.truncated,
           frameId: sender.frameId,
           streamId: st.id,
+          source: st.source,
         });
       }
       return;
     }
-    case 'save-mse':
-      chrome.tabs
-        .sendMessage(msg.tabId, { type: 'mse-save', id: msg.streamId, filename: msg.filename }, { frameId: msg.frameId })
-        .catch(() => {});
-      return;
+    case 'download-mse':
+      startMse(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
+      return true;
+    case 'mse-ready':
+      onMseReady(msg).then(reply, () => reply({}));
+      return true;
     case 'download':
       downloadFile(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;

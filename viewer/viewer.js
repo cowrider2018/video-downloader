@@ -164,33 +164,20 @@ function startHls(m, url, tag, audio) {
   return video;
 }
 
-function mseExt(mime) {
-  const type = mime.split(';')[0].trim();
-  if (type === 'audio/mp4') return 'm4a';
-  if (type === 'audio/webm') return 'weba';
-  if (type.endsWith('/webm')) return 'webm';
-  return 'mp4';
-}
-
-// MSE captures are saved by the page itself (the data only exists there).
-function mseRow(m) {
-  const label = m.mime.startsWith('audio/') ? '音訊' : '影像';
-  const codec = m.mime.match(/codecs="?([^",]+)/)?.[1] || m.mime.split(';')[0];
-  const button = queueButton(m.url, () =>
-    send({
-      type: 'save-mse',
-      tabId: tab.id,
-      frameId: m.frameId,
-      streamId: m.streamId,
-      filename: filenameFor(titleForFiles(), mseExt(m.mime), label),
-    }),
+// One row per player: its video and audio tracks are captured together. Downloading makes the
+// player buffer the whole video (the hook walks the playhead), then saves what it appended.
+function mseRow(tracks) {
+  const codecs = tracks.map((t) => t.mime.match(/codecs="?([^",]+)/)?.[1] || t.mime.split(';')[0]);
+  const total = tracks.reduce((n, t) => n + (t.size || 0), 0);
+  const key = `mse:${tracks[0].frameId}:${tracks[0].source}`;
+  const button = queueButton(key, () =>
+    send({ type: 'download-mse', tabId: tab.id, mediaId: tracks[0].id, title: titleForFiles() }),
   );
-  if (!m.size) button.disabled = true;
   return {
-    key: m.url,
-    name: `緩存${label} (${codec})`,
-    title: m.mime,
-    meta: ['MSE', formatBytes(m.size), m.truncated ? '已達上限' : ''],
+    key,
+    name: `緩存 (${codecs.join(' + ')})`,
+    title: tracks.map((t) => t.mime).join(' | '),
+    meta: ['MSE', formatBytes(total), tracks.some((t) => t.truncated) ? '已達上限' : ''],
     buttons: [button],
   };
 }
@@ -224,7 +211,6 @@ function dashRows(m, name) {
 }
 
 function rowsFor(m) {
-  if (m.kind === 'mse') return [mseRow(m)];
   if (m.kind === 'dash') return dashRows(m, displayName(m.url));
   const name = displayName(m.url);
   const row = (key, meta, button) => ({ key, name, title: key, meta, buttons: [button] });
@@ -252,7 +238,22 @@ function rowsFor(m) {
 }
 
 const renderMediaRows = makeRenderer(mediaList, '尚未偵測到媒體');
-const renderMedia = () => renderMediaRows(media.filter((m) => !m.parent).flatMap(rowsFor));
+function renderMedia() {
+  const shown = media.filter((m) => !m.parent);
+  const rows = [];
+  const players = new Set();
+  for (const m of shown) {
+    if (m.kind !== 'mse') {
+      rows.push(...rowsFor(m));
+      continue;
+    }
+    const player = `${m.frameId}:${m.source}`;
+    if (players.has(player)) continue;
+    players.add(player);
+    rows.push(mseRow(shown.filter((x) => x.kind === 'mse' && `${x.frameId}:${x.source}` === player)));
+  }
+  renderMediaRows(rows);
+}
 
 // ---- Download queue -------------------------------------------------------------------
 
@@ -260,6 +261,12 @@ const renderMedia = () => renderMediaRows(media.filter((m) => !m.parent).flatMap
 const nativeProgress = new Map(); // downloadId -> { bytes, total }
 
 function progressText(j) {
+  if (j.kind === 'mse') {
+    // Progress is how far the player has buffered, in milliseconds.
+    if (!j.total) return '準備中';
+    const pct = `${Math.floor((j.done / j.total) * 100)}%`;
+    return `${pct} · 已緩衝 ${formatDuration(j.done / 1000)} / ${formatDuration(j.total / 1000)}`;
+  }
   if (j.kind === 'native') {
     const p = nativeProgress.get(j.downloadId);
     if (!p) return '下載中';
