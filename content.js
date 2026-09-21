@@ -34,4 +34,24 @@
   );
 
   scan();
+
+  // The document shown directly inside the viewer window names the downloads.
+  if (window !== window.top && window.parent === window.top) {
+    let last = null;
+    const sendTitle = () => {
+      if (document.title === last) return;
+      last = document.title;
+      try {
+        chrome.runtime.sendMessage({ type: 'page-title', title: last }).catch(() => {});
+      } catch {
+        // Extension was reloaded.
+      }
+    };
+    sendTitle();
+    new MutationObserver(sendTitle).observe(document.head || document.documentElement, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+  }
 })();

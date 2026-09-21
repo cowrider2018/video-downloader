@@ -2,10 +2,21 @@
 
 Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS 串流，一鍵下載。功能參考 Video DownloadHelper。
 
+## 使用方式
+
+點工具列圖示會開啟一個獨立小視窗（已開啟則切換過去），版面只有三部分：
+
+1. **網址列**：貼上網址按 Enter。開啟時會自動載入目前分頁的網址。
+2. **網頁**：內嵌的小瀏覽器，在裡面播放影片；站內換頁時網址列會跟著更新。
+3. **媒體清單**：一列一個檔案，右側按鈕下載；HLS 的每種畫質各佔一列，按鈕會顯示進度（點擊可取消），完成後變成「顯示」。
+
+視窗獨立於一般分頁，不會像彈出面板那樣一點網頁就關閉。只有這個視窗中的頁面會被偵測。
+
 ## 功能
 
-- **自動偵測**：監看網路回應（`video/*`、`audio/*`、`.mp4`／`.webm`／`.m3u8` 等），並掃描頁面中的 `<video>`／`<audio>`。工具列徽章顯示偵測到的數量。
-- **直接下載**：一般影音檔交給 Chrome 下載管理員，檔名取自分頁標題。
+- **自動偵測**：監看網路回應（`video/*`、`audio/*`、`.mp4`／`.webm`／`.m3u8` 等），並掃描頁面中的 `<video>`／`<audio>`。
+- **可內嵌任意網站**：僅對此視窗內的框架移除 `X-Frame-Options` 與 `Content-Security-Policy` 標頭。
+- **直接下載**：一般影音檔交給 Chrome 下載管理員，檔名取自頁面標題。
 - **HLS 串流**：解析 master playlist 列出所有畫質，平行下載片段、支援 AES-128 解密與 byte-range，合併成單一 `.ts`（fMP4 串流則為 `.mp4`）。音訊獨立的串流會另存一個音訊檔。
 - **Referer 處理**：下載時以 `declarativeNetRequest` 對需要的主機帶上原頁面的 Referer／Origin，避免 CDN 拒絕。
 - 過濾串流片段（`.ts`、`.m4s`）與小於 512 KB 的檔案（多半是預覽或廣告）。
@@ -17,6 +28,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 
 ## 限制
 
+- 網頁在框架中載入：少數網站會偵測被內嵌而拒絕運作，登入狀態也可能因第三方 Cookie 限制而不同。
 - 不支援 DRM／SAMPLE-AES 加密內容與直播串流。
 - 不支援 DASH（`.mpd`）與以 MediaSource 播放的 `blob:` 影片（例如 YouTube）。
 - HLS 合併在記憶體中進行，非常大的影片會佔用相當記憶體。
@@ -26,10 +38,10 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 
 | 檔案 | 角色 |
 | --- | --- |
-| `background.js` | Service worker：偵測媒體、每分頁清單（`storage.session`）、徽章、HLS 解析預覽、下載工作管理、Referer 規則 |
-| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源 |
+| `background.js` | Service worker：開啟視窗、框架標頭規則、偵測媒體（`storage.session`）、HLS 解析預覽、下載工作管理、Referer 規則 |
+| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源與頁面標題 |
 | `offscreen/` | 執行 HLS 下載：抓片段、解密、組成 Blob（service worker 無法建立 blob URL） |
-| `popup/` | 彈出視窗：媒體清單、畫質選擇、下載進度 |
+| `viewer/` | 小視窗：網址列、內嵌網頁、媒體清單與下載進度 |
 | `lib/media.js`、`lib/hls.js` | 共用的純函式（分類、檔名、m3u8 解析），有單元測試 |
 
 ## 開發

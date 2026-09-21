@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Video Downloader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Video Downloader",
   "permissions": [
     "webRequest",
+    "webNavigation",
     "downloads",
     "storage",
-    "tabs",
     "offscreen",
     "declarativeNetRequestWithHostAccess"
   ],
@@ -32,7 +32,6 @@
     }
   ],
   "action": {
-    "default_popup": "popup/popup.html",
     "default_title": "Video Downloader",
     "default_icon": {
       "16": "icons/icon16.png",

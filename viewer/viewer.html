@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <title>Video Downloader</title>
+    <link rel="icon" href="../icons/icon32.png" />
+    <link rel="stylesheet" href="viewer.css" />
+  </head>
+  <body>
+    <form id="bar">
+      <input id="addr" type="text" autocomplete="off" spellcheck="false" />
+    </form>
+    <iframe
+      id="frame"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-downloads allow-modals"
+      allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+    ></iframe>
+    <ul id="media"></ul>
+    <script type="module" src="viewer.js"></script>
+  </body>
+</html>
