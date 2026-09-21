@@ -8,7 +8,8 @@ import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
 //   tab:<id>   media detected in that tab
 //   page:<id>  { url, title } of the page framed in a viewer tab
 //   ids:<id>   { [host]: headers } the tab's latest request identity per host
-//   viewers    { [tabId]: ruleId } open viewer tabs and their frame-header rule
+//   viewers    { [tabId]: { ruleId, frameId } } open viewer tabs: their frame-header rule and
+//              the frame showing the page (capture frames are other frames of the same tab)
 //   jobs       downloads, newest first
 const tabKey = (tabId) => `tab:${tabId}`;
 const pageKey = (tabId) => `page:${tabId}`;
@@ -35,6 +36,16 @@ function update(key, fn) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Events about one tab's page (navigation, media, players, title) handled strictly in the
+// order they arrived: their handlers look things up asynchronously, and a new page's media
+// must not land before the navigation that clears the old page's list.
+const tabTasks = new Map();
+function inOrder(tabId, task) {
+  const run = (tabTasks.get(tabId) || Promise.resolve()).then(task).catch((e) => console.error(e));
+  tabTasks.set(tabId, run);
+  return run;
+}
 const newRuleId = () => 1 + Math.floor(Math.random() * 0x7ffffffe);
 const removeRules = (ids) =>
   ids.length ? chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids }).catch(() => {}) : null;
@@ -101,16 +112,6 @@ async function navigated(tabId, url, frameId) {
   await update(tabKey(tabId), () => []);
   // The new page may have reported its title before this (the two race): use it then.
   if (url) await update(pageKey(tabId), (p = {}) => ({ url, frameId, title: p.early?.url === url ? p.early.title : '' }));
-  // An MSE capture lives in the page, unlike every other download.
-  await update(JOBS, (jobs = []) =>
-    jobs.some((j) => j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status))
-      ? jobs.map((j) =>
-          j.kind === 'mse' && j.tabId === tabId && ['running', 'paused'].includes(j.status)
-            ? { ...j, status: 'failed', error: '頁面已離開' }
-            : j,
-        )
-      : undefined,
-  );
 }
 
 // ---- Request identity -----------------------------------------------------------------
@@ -190,11 +191,21 @@ async function getViewers() {
 
 const isViewer = async (tabId) => String(tabId) in (await getViewers());
 
+// The frame of a viewer tab that shows the page (not a capture frame), or null.
+const pageFrameOf = async (tabId) => (await getViewers())[tabId]?.frameId ?? null;
+
+// Whether a frame belongs to a capture: what it loads or reports is not the page's.
+async function isCaptureFrame(tabId, frameId) {
+  const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
+  return jobs.some((j) => j.kind === 'mse' && j.tabId === tabId && j.frameId === frameId && j.status !== 'done');
+}
+
 // Sites refuse to be framed via X-Frame-Options / CSP frame-ancestors; strip both, but only
 // for frames inside this viewer tab.
 async function registerViewer(tabId) {
   const viewers = await getViewers();
-  const ruleId = viewers[tabId] ?? newRuleId();
+  const ruleId = viewers[tabId]?.ruleId ?? newRuleId();
+  const frameId = viewers[tabId]?.frameId ?? null;
   await chrome.declarativeNetRequest.updateSessionRules({
     removeRuleIds: [ruleId],
     addRules: [
@@ -212,14 +223,14 @@ async function registerViewer(tabId) {
       },
     ],
   });
-  viewersCache = await update(VIEWERS, (v = {}) => ({ ...v, [tabId]: ruleId }));
+  viewersCache = await update(VIEWERS, (v = {}) => ({ ...v, [tabId]: { ruleId, frameId } }));
   await setCapture(true);
 }
 
 async function unregisterViewer(tabId) {
   const viewers = await getViewers();
   if (!(tabId in viewers)) return;
-  removeRules([viewers[tabId]]);
+  removeRules([viewers[tabId].ruleId]);
   viewersCache = await update(VIEWERS, (v = {}) => {
     const { [tabId]: _, ...rest } = v;
     return rest;
@@ -442,49 +453,72 @@ async function startDash({ tabId, mediaId, repId, title, tag }, extra = {}) {
 }
 
 // ---- MSE captures -------------------------------------------------------------------
-// The page's own player buffers the whole video while the hook walks the playhead ahead
-// (inject/mse-hook.js); the content script assembles the tracks and hands back blob: URLs.
+// A capture runs in a frame of its own: the viewer loads the page again, out of sight, and
+// the hook there makes that copy's player buffer the whole video (inject/mse-hook.js); its
+// content script assembles the tracks and hands back blob: URLs. The page on show can be
+// left or changed meanwhile. A couple run at once; the rest wait their turn.
+
+const MAX_CAPTURES = 2;
 
 const toPage = (job, msg) =>
   chrome.tabs.sendMessage(job.tabId, { ...msg, id: job.id }, { frameId: job.frameId ?? 0 }).catch(() => {});
 
-async function startMse({ tabId, mediaId, title }) {
-  const item = await findMedia(tabId, mediaId);
-  if (!item) throw new Error('找不到這個媒體，頁面可能已經換頁');
-  const job = await newJob({
-    kind: 'mse',
-    tabId,
-    frameId: item.frameId ?? 0,
-    source: item.source,
-    url: item.url,
-    title,
-    filename: filenameFor(title, 'mp4'),
-  });
-  toPage(job, { type: 'mse-capture', source: item.source });
+const toViewer = (tabId, msg) => chrome.runtime.sendMessage({ target: 'viewer', tabId, ...msg }).catch(() => {});
+
+async function startMse({ tabId, title }) {
+  await startCapture(tabId, title, {});
 }
 
-// A capture of whichever player the page has (the busiest, or the first video, started
-// muted). `fields` carry on an automatic download's record.
-async function captureAny(tabId, title, fields) {
-  const { [tabKey(tabId)]: list = [], [pageKey(tabId)]: page = {} } = await chrome.storage.session.get([tabKey(tabId), pageKey(tabId)]);
-  const players = list.filter((m) => m.kind === 'mse').sort((a, b) => (b.size || 0) - (a.size || 0));
+// `fields` carry on an automatic download's record (with its id) or start a new one.
+async function startCapture(tabId, title, fields) {
+  const { [pageKey(tabId)]: page = {} } = await chrome.storage.session.get(pageKey(tabId));
+  if (!/^https?:/.test(page.url || '')) throw new Error('沒有可擷取的網頁');
   const job = {
     kind: 'mse',
     tabId,
-    frameId: players[0]?.frameId ?? page.frameId ?? 0,
-    source: players[0]?.source ?? null,
+    frameId: null,
+    url: page.url,
     title,
     filename: filenameFor(title, 'mp4'),
+    status: 'queued',
     ...fields,
   };
-  let saved;
-  if (fields.id) {
-    await patchJob(fields.id, job);
-    saved = await findJob((j) => j.id === fields.id);
-  } else {
-    saved = await newJob(job);
+  if (fields.id) await patchJob(fields.id, job);
+  else await newJob(job);
+  await nextCaptures();
+}
+
+// Starts waiting captures while fewer than MAX_CAPTURES are running.
+async function nextCaptures() {
+  const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
+  const busy = jobs.filter((j) => j.kind === 'mse' && ['running', 'paused', 'saving'].includes(j.status)).length;
+  const waiting = jobs.filter((j) => j.kind === 'mse' && j.status === 'queued').reverse(); // oldest first
+  for (const job of waiting.slice(0, Math.max(0, MAX_CAPTURES - busy))) {
+    await patchJob(job.id, { status: 'running' });
+    toViewer(job.tabId, { type: 'spawn-capture', id: job.id, url: job.url });
   }
-  toPage(saved, { type: 'mse-capture', source: saved.source });
+}
+
+// Frames directly under a viewer say who they are (their iframe's name) as each page starts:
+// "vd-page" shows the page, "vd-capture:<job id>" runs a capture. A page that renames its
+// window is still known by its frame id.
+async function onFrameRole(tabId, frameId, { name, url }) {
+  const capture = /^vd-capture:(.+)$/.exec(name);
+  if (capture) {
+    await patchJob(capture[1], { frameId });
+    return;
+  }
+  if (name !== 'vd-page' && frameId !== (await pageFrameOf(tabId))) return;
+  viewersCache = await update(VIEWERS, (v = {}) => (v[tabId] ? { ...v, [tabId]: { ...v[tabId], frameId } } : undefined));
+  await navigated(tabId, url, frameId);
+}
+
+async function onFrameLoaded(tabId, frameId) {
+  await update(JOBS, () => undefined); // after any pending write (the frame id may be on its way)
+  const job = await findJob((j) => j.kind === 'mse' && j.tabId === tabId && j.frameId === frameId && !j.started);
+  if (!job) return;
+  await patchJob(job.id, { started: true });
+  toPage(job, { type: 'mse-capture', source: null });
 }
 
 // ---- Automatic mode -----------------------------------------------------------------
@@ -541,7 +575,7 @@ async function startDashWithAudio(m, main, audio, { tabId, title, fields }) {
 async function startAuto({ tabId, title }) {
   const { [tabKey(tabId)]: list = [] } = await chrome.storage.session.get(tabKey(tabId));
   const network = bestNetworkMedia(list);
-  if (!network) return captureAny(tabId, title, { auto: [], method: '緩存' });
+  if (!network) return startCapture(tabId, title, { auto: [], method: '緩存' });
   await network.start({ tabId, title, fields: { auto: ['mse'], method: network.method } });
 }
 
@@ -558,9 +592,8 @@ async function failJob(id, error) {
   for (const companion of jobs.filter((j) => j.companionOf === id)) deleteJob(companion.id);
   const [next, ...rest] = job.auto;
   if (next === 'mse') {
-    await captureAny(job.tabId, job.title, {
+    await startCapture(job.tabId, job.title, {
       id,
-      status: 'running',
       auto: rest,
       method: '緩存',
       done: 0,
@@ -576,13 +609,13 @@ async function failJob(id, error) {
 
 // Saves the assembled files. Replies with the ones the downloads API refused, for the page
 // to save itself.
-async function onMseReady({ id, files }) {
+async function onMseReady({ id, files, title: pageTitle }) {
   const job = await findJob((j) => j.id === id);
   if (!job) return {};
-  // Started before the page had reported its title (named after the host)? It has one by now.
-  const { [pageKey(job.tabId)]: page = {} } = await chrome.storage.session.get(pageKey(job.tabId));
-  const host = /^https?:/.test(page.url || '') ? new URL(page.url).hostname : '';
-  const title = job.title === host && page.title ? page.title : job.title;
+  // Started before the page had reported its title (named after the host)? The capture's
+  // copy of the page knows it.
+  const host = /^https?:/.test(job.url || '') ? new URL(job.url).hostname : '';
+  const title = job.title === host && pageTitle ? pageTitle : job.title;
   const named = files.map((f) => ({ ...f, filename: filenameFor(title, f.ext, f.label) }));
   await patchJob(id, {
     status: 'saving',
@@ -637,8 +670,12 @@ async function onJobReady({ id, blobUrl, ext, size }) {
 async function finishJob(job) {
   const latest = (await findJob((j) => j.id === job.id)) || job;
   removeRules(Object.values(latest.rules || {}));
-  if (job.kind === 'mse') toPage(job, { type: 'mse-release' });
-  else toOffscreen({ type: 'release', id: job.id });
+  if (job.kind === 'mse') {
+    toViewer(job.tabId, { type: 'drop-capture', id: job.id });
+    nextCaptures();
+  } else {
+    toOffscreen({ type: 'release', id: job.id });
+  }
   const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
   const busy = jobs.some((j) => ['file', 'hls', 'dash'].includes(j.kind) && ['running', 'paused', 'saving'].includes(j.status));
   if (!busy) chrome.offscreen.closeDocument().catch(() => {});
@@ -762,25 +799,61 @@ chrome.webRequest.onHeadersReceived.addListener(
     for (const { name, value } of d.responseHeaders || []) headers[name.toLowerCase()] = value;
     const size = sizeFromHeaders(headers);
     const hit = classify(d.url, headers['content-type'], size);
-    if (hit) addMedia(d.tabId, { url: d.url, ...hit, size, headers: sent, frameId: d.frameId });
+    if (!hit) return;
+    inOrder(d.tabId, async () => {
+      if (!(await isCaptureFrame(d.tabId, d.frameId))) await addMedia(d.tabId, { url: d.url, ...hit, size, headers: sent, frameId: d.frameId });
+    });
   },
   MEDIA_FILTER,
   ['responseHeaders'],
 );
 
 // In a viewer the page lives in the frame directly under the viewer page.
+// (In a viewer, the framed page reports its own navigations: see onFrameRole.)
 chrome.webNavigation.onCommitted.addListener(async (d) => {
-  const viewer = await isViewer(d.tabId);
-  if (d.frameId === 0 && !viewer) navigated(d.tabId);
-  else if (viewer && d.parentFrameId === 0 && /^https?:/i.test(d.url)) navigated(d.tabId, d.url, d.frameId);
+  if (d.frameId === 0 && !(await isViewer(d.tabId))) navigated(d.tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  tabTasks.delete(tabId);
+  // Captures run in frames of the viewer: closing it ends them.
+  update(JOBS, (jobs = []) =>
+    jobs.map((j) =>
+      j.kind === 'mse' && j.tabId === tabId && ['queued', 'running', 'paused'].includes(j.status)
+        ? { ...j, status: 'failed', error: '小視窗已關閉' }
+        : j,
+    ),
+  );
   chrome.storage.session.remove([tabKey(tabId), pageKey(tabId), idsKey(tabId)]);
   for (const key of [tabKey(tabId), pageKey(tabId)]) chains.delete(key);
   identities.delete(tabId);
   unregisterViewer(tabId);
 });
+
+// <video>/<audio> sources the page's content script found.
+async function addDomMedia(tabId, frameId, urls) {
+  for (const url of urls) {
+    // A <video src> without a recognizable extension is still a video.
+    const hit = classify(url, '', null) ?? (urlExt(url) ? null : { kind: 'file', ext: 'mp4' });
+    if (hit) await addMedia(tabId, { url, ...hit, size: null, frameId });
+  }
+}
+
+// SourceBuffers the MSE hook saw: one item per track, grouped by player (source) in the viewer.
+async function addPlayers(tabId, frameId, streams) {
+  for (const st of streams) {
+    await addMedia(tabId, {
+      url: `mse:${frameId}:${st.id}`,
+      kind: 'mse',
+      mime: String(st.mime),
+      size: Number(st.bytes) || 0,
+      truncated: !!st.truncated,
+      frameId,
+      streamId: st.id,
+      source: st.source,
+    });
+  }
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.target === 'offscreen') return;
@@ -788,43 +861,38 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     case 'viewer-open':
       registerViewer(sender.tab.id).then(() => reply(true), (e) => reply({ error: e.message }));
       return true;
+    case 'frame-role':
+      if (sender.tab) {
+        inOrder(sender.tab.id, async () => {
+          if (await isViewer(sender.tab.id)) await onFrameRole(sender.tab.id, sender.frameId, msg);
+        });
+      }
+      return;
+    case 'frame-loaded':
+      if (sender.tab) onFrameLoaded(sender.tab.id, sender.frameId);
+      return;
     case 'page-title': {
       const tabId = sender.tab?.id;
       if (tabId == null) return;
-      isViewer(tabId).then((yes) => {
-        if (yes) {
-          update(pageKey(tabId), (p = {}) =>
+      inOrder(tabId, async () => {
+        if ((await pageFrameOf(tabId)) === sender.frameId) {
+          await update(pageKey(tabId), (p = {}) =>
             p.url === msg.url ? { ...p, title: msg.title } : { ...p, early: { url: msg.url, title: msg.title } },
           );
         }
       });
       return;
     }
-    case 'dom-media': {
-      const tabId = sender.tab?.id;
-      if (tabId == null) return;
-      for (const url of msg.urls) {
-        // A <video src> without a recognizable extension is still a video.
-        const hit = classify(url, '', null) ?? (urlExt(url) ? null : { kind: 'file', ext: 'mp4' });
-        if (hit) addMedia(tabId, { url, ...hit, size: null, frameId: sender.frameId });
-      }
-      return;
-    }
+    case 'dom-media':
     case 'mse-streams': {
       const tabId = sender.tab?.id;
       if (tabId == null) return;
-      for (const st of msg.streams) {
-        addMedia(tabId, {
-          url: `mse:${sender.frameId}:${st.id}`,
-          kind: 'mse',
-          mime: String(st.mime),
-          size: Number(st.bytes) || 0,
-          truncated: !!st.truncated,
-          frameId: sender.frameId,
-          streamId: st.id,
-          source: st.source,
-        });
-      }
+      // A capture frame's copy of the page is not what the viewer shows.
+      inOrder(tabId, async () => {
+        if (await isCaptureFrame(tabId, sender.frameId)) return;
+        if (msg.type === 'dom-media') await addDomMedia(tabId, sender.frameId, msg.urls);
+        else await addPlayers(tabId, sender.frameId, msg.streams);
+      });
       return;
     }
     case 'download-auto':

@@ -161,7 +161,8 @@
   }
 
   // A MediaSource to capture: the given one, else the one with the most data, else (no
-  // player started yet) start the first video muted and wait for one to appear.
+  // player started yet, e.g. a page just loaded for the capture) start the first video
+  // muted and wait for one to appear.
   async function pickSource(id) {
     const byId = id && mediaSourceById(id);
     if (byId) return byId;
@@ -177,7 +178,10 @@
       video.muted = true;
       video.play().catch(() => {});
     }
-    for (let i = 0; i < 50 && !busiest(); i++) await sleep(100);
+    for (let i = 0; i < 150 && !busiest(); i++) {
+      if (i % 20 === 19) document.querySelector('video')?.play().catch(() => {});
+      await sleep(100);
+    }
     return busiest();
   }
 

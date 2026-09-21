@@ -53,7 +53,6 @@
 
   // A capture job: the hook walks the player's buffer; its tracks come back here to be put
   // in order (lib/fragments.js) and handed to the extension as files.
-  const captures = new Map(); // job id -> blob: URLs, released once saved
   const passes = new Map(); // job id -> how many times the buffer has been walked
   const lengths = new Map(); // job id -> longest duration the player has reported
   const MAX_PASSES = 2;
@@ -109,8 +108,7 @@
           return { blobUrl: URL.createObjectURL(blob), ext: extOf(t.mime), label, size: blob.size };
         });
       }
-      captures.set(job, files.map((f) => f.blobUrl));
-      const res = await send({ type: 'mse-ready', id: job, files });
+      const res = await send({ type: 'mse-ready', id: job, files, title: document.title });
       // The downloads API may refuse a blob: URL of the page's origin; save from the page then.
       for (const a of res?.anchors || []) {
         const link = document.createElement('a');
@@ -199,10 +197,6 @@
       case 'mse-cancel':
         toHook(`capture-${msg.type.slice(4)}`, { job: msg.id });
         return;
-      case 'mse-release':
-        for (const url of captures.get(msg.id) || []) URL.revokeObjectURL(url);
-        captures.delete(msg.id);
-        return;
       case 'fetch-text':
         lib()
           .then(({ makeFetchBytes }) => makeFetchBytes({ fetchImpl: pageFetch(msg.headers) })(msg.url, null))
@@ -221,6 +215,12 @@
     window.parent === window.top &&
     location.ancestorOrigins?.[0]?.startsWith('chrome-extension://');
   if (inViewer) {
+    // The viewer's page frame and its capture frames alike: say which (the iframe's name, read
+    // before the page's own scripts could change it) as the page starts, and when it is in.
+    send({ type: 'frame-role', name: window.name, url: location.href });
+    const loaded = () => send({ type: 'frame-loaded' });
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', loaded);
+    else loaded();
     let last = null;
     const sendTitle = () => {
       if (document.title === last) return;

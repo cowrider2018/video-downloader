@@ -292,7 +292,7 @@ function progressText(j) {
 // the queue (or, once finished, just drops the entry; the file stays on disk).
 function jobRow(j) {
   const act = (type) => () => send({ type, id: j.id });
-  const unfinished = ['running', 'paused', 'saving'].includes(j.status);
+  const unfinished = ['queued', 'running', 'paused', 'saving'].includes(j.status);
   const remove = { text: '×', title: unfinished ? '取消並刪除' : '從清單移除', onClick: act('delete-job') };
   // Hovering the name shows the source and, for an automatic job, why earlier methods failed.
   const title = [j.url, ...(j.tried || [])].filter(Boolean).join(' | ');
@@ -305,6 +305,10 @@ function jobRow(j) {
     case 'paused':
       spec.meta = ['已暫停', progressText(j)];
       spec.buttons = [{ text: '繼續', onClick: act('resume-job') }, remove];
+      break;
+    case 'queued':
+      spec.meta = ['排隊中'];
+      spec.buttons = [remove];
       break;
     case 'saving':
       spec.meta = ['存檔中'];
@@ -359,6 +363,25 @@ chrome.storage.session.onChanged.addListener((changes) => {
 });
 
 await send({ type: 'viewer-open' });
+
+// Captures run in frames of their own (the page loaded again, out of sight), so the page on
+// show can change meanwhile.
+const captureFrames = new Map(); // job id -> iframe
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.target !== 'viewer' || msg.tabId !== tab.id) return;
+  if (msg.type === 'spawn-capture') {
+    const f = document.createElement('iframe');
+    f.name = `vd-capture:${msg.id}`; // how the service worker recognises it
+    f.setAttribute('sandbox', frame.getAttribute('sandbox'));
+    f.setAttribute('allow', frame.getAttribute('allow'));
+    f.src = msg.url;
+    document.getElementById('captures').append(f);
+    captureFrames.set(msg.id, f);
+  } else if (msg.type === 'drop-capture') {
+    captureFrames.get(msg.id)?.remove();
+    captureFrames.delete(msg.id);
+  }
+});
 
 const stored = await chrome.storage.session.get([mediaKey, pageKey, 'jobs']);
 media = stored[mediaKey] || [];

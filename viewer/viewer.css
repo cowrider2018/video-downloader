@@ -67,6 +67,20 @@ body {
 /* The media list and the download queue are exactly as tall as their rows, like the
    address bar, so resizing the window only resizes the page above them. The page may shrink
    away entirely; only then do they shrink and scroll. */
+/* Frames running captures: laid out (browsers pause media that is out of view or hidden)
+   but behind everything and transparent. */
+#captures iframe {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 640px;
+  height: 360px;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  z-index: -1;
+}
+
 #media {
   flex: 0 1 auto;
   min-height: 33px;
