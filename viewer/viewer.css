@@ -50,7 +50,7 @@ body {
 }
 
 #frame {
-  flex: 1;
+  flex: 1 1 0;
   width: 100%;
   min-height: 0;
   border: 0;
@@ -64,14 +64,20 @@ body {
   list-style: none;
 }
 
+/* The media list and the download queue are exactly as tall as their rows, like the
+   address bar, so resizing the window only resizes the page above them. The page may shrink
+   away entirely; only then do they shrink and scroll. */
 #media {
-  flex: none;
-  max-height: 26vh;
+  flex: 0 1 auto;
+  min-height: 33px;
   border-top: 1px solid var(--line);
 }
 
 #queue {
-  flex: none;
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-height: 56px;
   border-top: 1px solid var(--line);
 }
 
@@ -84,7 +90,7 @@ body {
 }
 
 #jobs {
-  max-height: 22vh;
+  min-height: 0;
 }
 
 .list li {

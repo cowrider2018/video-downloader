@@ -9,7 +9,6 @@ const addr = document.getElementById('addr');
 const frame = document.getElementById('frame');
 const mediaList = document.getElementById('media');
 const jobList = document.getElementById('jobs');
-const queue = document.getElementById('queue');
 
 const send = (msg) => chrome.runtime.sendMessage(msg);
 
@@ -263,12 +262,8 @@ function jobRow(j) {
   return spec;
 }
 
-const renderJobRows = makeRenderer(jobList, '');
-
-function renderJobs() {
-  queue.hidden = !jobs.length;
-  renderJobRows(jobs.map(jobRow));
-}
+const renderJobRows = makeRenderer(jobList, '沒有下載');
+const renderJobs = () => renderJobRows(jobs.map(jobRow));
 
 async function pollNative() {
   const active = jobs.filter((j) => j.kind === 'native' && j.downloadId != null);
