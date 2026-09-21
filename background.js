@@ -379,7 +379,8 @@ async function retryAsPage(job) {
 
 async function onJobReady({ id, blobUrl, ext, size }) {
   const job = await findJob((j) => j.id === id);
-  if (!job) return;
+  // Deleted while it was finishing: just let go of the blob.
+  if (!job) return void toOffscreen({ type: 'release', id });
   const filename = job.kind === 'hls' ? filenameFor(job.title, ext, job.tag) : job.filename;
   await patchJob(id, { status: 'saving', filename, bytes: size, done: job.total || size, total: job.total || size });
   try {
@@ -397,7 +398,7 @@ async function finishJob(job) {
   removeRules(Object.values(latest.rules || {}));
   toOffscreen({ type: 'release', id: job.id });
   const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
-  const busy = jobs.some((j) => j.kind !== 'native' && (j.status === 'running' || j.status === 'saving'));
+  const busy = jobs.some((j) => j.kind !== 'native' && ['running', 'paused', 'saving'].includes(j.status));
   if (!busy) chrome.offscreen.closeDocument().catch(() => {});
 }
 
@@ -407,17 +408,45 @@ async function onJobFailed({ id, cancelled, error }) {
   if (job) finishJob(job);
 }
 
-async function cancelJob(id) {
+// Pausing keeps what has been downloaded; resuming carries on from there.
+async function pauseJob(id) {
   const job = await findJob((j) => j.id === id);
-  if (!job || job.status !== 'running') return;
+  if (job?.status !== 'running') return;
+  await patchJob(id, { status: 'paused' });
   if (job.kind === 'native') {
-    await patchJob(id, { status: 'cancelled' });
-    if (job.downloadId != null) chrome.downloads.cancel(job.downloadId).catch(() => {});
-    return;
+    if (job.downloadId != null) chrome.downloads.pause(job.downloadId).catch(() => {});
+  } else {
+    toOffscreen({ type: 'pause', id });
   }
-  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (contexts.length) toOffscreen({ type: 'cancel', id });
-  else await patchJob(id, { status: 'cancelled' });
+}
+
+async function resumeJob(id) {
+  const job = await findJob((j) => j.id === id);
+  if (job?.status !== 'paused') return;
+  await patchJob(id, { status: 'running' });
+  if (job.kind === 'native') {
+    if (job.downloadId != null) chrome.downloads.resume(job.downloadId).catch(() => {});
+  } else {
+    toOffscreen({ type: 'resume', id });
+  }
+}
+
+// Removes a job from the queue, cancelling it first if it is still going (the partial data
+// goes with it). A finished file stays on disk.
+async function deleteJob(id) {
+  const job = await findJob((j) => j.id === id);
+  if (!job) return;
+  await update(JOBS, (jobs = []) => jobs.filter((j) => j.id !== id));
+  const unfinished = ['running', 'paused', 'saving'].includes(job.status);
+  if (!unfinished) return;
+  if (job.downloadId != null) {
+    await chrome.downloads.cancel(job.downloadId).catch(() => {});
+    chrome.downloads.erase({ id: job.downloadId }).catch(() => {});
+  }
+  if (job.kind !== 'native') {
+    toOffscreen({ type: 'cancel', id });
+    finishJob(job);
+  }
 }
 
 chrome.downloads.onChanged.addListener(async (delta) => {
@@ -546,11 +575,14 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     case 'download-hls':
       startHls(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
-    case 'cancel-job':
-      cancelJob(msg.id);
+    case 'pause-job':
+      pauseJob(msg.id);
       return;
-    case 'remove-job':
-      update(JOBS, (jobs = []) => jobs.filter((j) => j.id !== msg.id || j.status === 'running' || j.status === 'saving'));
+    case 'resume-job':
+      resumeJob(msg.id);
+      return;
+    case 'delete-job':
+      deleteJob(msg.id);
       return;
     case 'identity':
       findJob((j) => j.id === msg.id)
@@ -560,7 +592,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     case 'job-progress':
       update(JOBS, (jobs = []) =>
         jobs.map((j) =>
-          j.id === msg.id && j.status === 'running' ? { ...j, done: msg.done, total: msg.total, bytes: msg.bytes } : j,
+          j.id === msg.id && ['running', 'paused'].includes(j.status)
+            ? { ...j, done: msg.done, total: msg.total, bytes: msg.bytes }
+            : j,
         ),
       );
       return;

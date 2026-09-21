@@ -2,9 +2,9 @@
 // carry the page's identity through header rules the service worker installs per host
 // (see installIdentity); the finished blob: URL goes back to the worker, which cannot
 // create blob URLs itself.
-import { fetchFile, makeFetchBytes, runHlsJob } from '../lib/hls-job.js';
+import { fetchFile, makeFetchBytes, makeGate, runHlsJob } from '../lib/hls-job.js';
 
-const running = new Map(); // job id -> { controller, cancelled, blobUrl }
+const running = new Map(); // job id -> { controller, gate, cancelled, blobUrl }
 
 const post = (msg) => chrome.runtime.sendMessage({ target: 'background', ...msg }).catch(() => {});
 
@@ -16,8 +16,11 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (r) {
       r.cancelled = true;
       r.controller.abort();
+      r.gate.resume(); // wake paused workers so they see the abort
     }
   }
+  if (msg.type === 'pause') running.get(msg.id)?.gate.pause();
+  if (msg.type === 'resume') running.get(msg.id)?.gate.resume();
   if (msg.type === 'release') {
     const r = running.get(msg.id);
     if (r?.blobUrl) URL.revokeObjectURL(r.blobUrl);
@@ -26,9 +29,10 @@ chrome.runtime.onMessage.addListener((msg) => {
 });
 
 async function run(job) {
-  const state = { controller: new AbortController(), cancelled: false, blobUrl: null };
+  const state = { controller: new AbortController(), gate: makeGate(), cancelled: false, blobUrl: null };
   running.set(job.id, state);
   const { signal } = state.controller;
+  const { gate } = state;
 
   const hosts = new Set();
   const beforeFetch = async (urls) => {
@@ -46,7 +50,8 @@ async function run(job) {
   let lastReport = 0;
   const onProgress = ({ done, total, bytes }) => {
     const now = Date.now();
-    if (done !== total && now - lastReport < 300) return;
+    // Throttled, except the last word before a pause, so a paused row shows where it stopped.
+    if (!gate.paused && done !== total && now - lastReport < 300) return;
     lastReport = now;
     post({ type: 'job-progress', id: job.id, done, total, bytes });
   };
@@ -56,10 +61,10 @@ async function run(job) {
     let ext = job.ext;
     if (job.kind === 'file') {
       await beforeFetch([job.url]);
-      blob = await fetchFile(job.url, { fetchImpl, signal, onProgress });
+      blob = await fetchFile(job.url, { fetchImpl, signal, onProgress, gate });
     } else {
       const fetchBytes = makeFetchBytes({ signal, fetchImpl });
-      ({ blob, ext } = await runHlsJob(job.url, { fetchBytes, signal, onProgress, beforeFetch }));
+      ({ blob, ext } = await runHlsJob(job.url, { fetchBytes, signal, onProgress, beforeFetch, gate }));
     }
     state.blobUrl = URL.createObjectURL(blob);
     post({ type: 'job-ready', id: job.id, blobUrl: state.blobUrl, ext, size: blob.size });

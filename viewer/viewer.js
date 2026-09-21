@@ -240,16 +240,25 @@ function progressText(j) {
   return j.kind === 'hls' ? `${pct} · ${j.done}/${j.total} 片段` : `${pct} · ${formatBytes(j.total)}`;
 }
 
+// Two separate controls: pause/resume keeps the download, × cancels it and drops it from
+// the queue (or, once finished, just drops the entry; the file stays on disk).
 function jobRow(j) {
-  const remove = { text: '✕', title: '從清單移除', onClick: () => send({ type: 'remove-job', id: j.id }) };
+  const act = (type) => () => send({ type, id: j.id });
+  const unfinished = ['running', 'paused', 'saving'].includes(j.status);
+  const remove = { text: '×', title: unfinished ? '取消並刪除' : '從清單移除', onClick: act('delete-job') };
   const spec = { key: j.id, name: j.filename, title: j.url, meta: [], buttons: [] };
   switch (j.status) {
     case 'running':
       spec.meta = [progressText(j)];
-      spec.buttons = [{ text: '取消', onClick: () => send({ type: 'cancel-job', id: j.id }) }];
+      spec.buttons = [{ text: '暫停', onClick: act('pause-job') }, remove];
+      break;
+    case 'paused':
+      spec.meta = ['已暫停', progressText(j)];
+      spec.buttons = [{ text: '繼續', onClick: act('resume-job') }, remove];
       break;
     case 'saving':
       spec.meta = ['存檔中'];
+      spec.buttons = [remove];
       break;
     case 'done':
       spec.meta = ['完成', formatBytes(j.bytes || nativeProgress.get(j.downloadId)?.total)];
