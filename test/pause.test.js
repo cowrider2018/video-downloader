@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
-import { fetchFile, makeGate, runHlsJob } from '../lib/hls-job.js';
+import { fetchFile, makeGate, runHlsJob } from '../lib/jobs.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

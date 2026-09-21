@@ -61,7 +61,7 @@
 
   // ---- Fetching as the page -------------------------------------------------------------
 
-  const lib = () => import(chrome.runtime.getURL('lib/hls-job.js'));
+  const lib = () => import(chrome.runtime.getURL('lib/jobs.js'));
 
   // Cross-origin CDNs answer either credentialed requests (specific Allow-Origin) or
   // anonymous ones (Allow-Origin: *), never both; learn which per host from the first try.

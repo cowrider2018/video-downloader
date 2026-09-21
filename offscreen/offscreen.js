@@ -2,7 +2,7 @@
 // carry the page's identity through header rules the service worker installs per host
 // (see installIdentity); the finished blob: URL goes back to the worker, which cannot
 // create blob URLs itself.
-import { fetchFile, makeFetchBytes, makeGate, runHlsJob } from '../lib/hls-job.js';
+import { fetchFile, makeFetchBytes, makeGate, runHlsJob } from '../lib/jobs.js';
 
 const running = new Map(); // job id -> { controller, gate, cancelled, blobUrl }
 

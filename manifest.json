@@ -50,7 +50,7 @@
     {
       "resources": [
         "lib/hls.js",
-        "lib/hls-job.js"
+        "lib/jobs.js"
       ],
       "matches": [
         "http://*/*",

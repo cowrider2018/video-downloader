@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createCipheriv, randomBytes } from 'node:crypto';
 import { test } from 'node:test';
-import { runHlsJob } from '../lib/hls-job.js';
+import { runHlsJob } from '../lib/jobs.js';
 
 const BASE = 'https://cdn.example.com/v/';
 
