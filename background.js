@@ -41,14 +41,25 @@ const removeRules = (ids) =>
 
 // ---- Detected media -------------------------------------------------------------------
 
-// A variant or audio playlist already offered through its master is hidden behind it.
+// URL without its query: players often add tokens or cache-busters to segment requests.
+const bare = (url) => url.split(/[?#]/)[0];
+
+// What a playlist already offers is hidden behind it: a master's variant, audio and subtitle
+// playlists, and the segments of any playlist (fMP4 segments look like ordinary .mp4 files).
 function linkChildren(list) {
   const parents = new Map();
   for (const m of list) {
-    for (const v of [...(m.variants || []), ...(m.audio || [])]) parents.set(v.url, m.id);
+    for (const v of [...(m.variants || []), ...(m.audio || [])]) parents.set(bare(v.url), m.id);
+    for (const url of [...(m.subtitles || []), ...(m.segmentUrls || [])]) parents.set(bare(url), m.id);
   }
-  return list.map((m) => (parents.has(m.url) && !m.parent ? { ...m, parent: parents.get(m.url) } : m));
+  return list.map((m) => {
+    const parent = parents.get(bare(m.url));
+    return parent && parent !== m.id && !m.parent ? { ...m, parent } : m;
+  });
 }
+
+// Enough segment URLs to recognise a playlist's segments, without filling up storage.
+const MAX_SEGMENT_URLS = 3000;
 
 async function addMedia(tabId, item) {
   let added = null;
@@ -271,13 +282,27 @@ async function askPage(tabId, frameId, msg, tries = 6) {
 
 function hlsInfo(text, url) {
   const pl = parsePlaylist(text, url);
-  if (pl.type === 'master') return { variants: pl.variants, audio: pl.audio };
-  return { duration: pl.duration, segments: pl.segments.length, live: !pl.endList, encryption: pl.encryption };
+  if (pl.type === 'master') return { variants: pl.variants, audio: pl.audio, subtitles: pl.subtitles };
+  const segmentUrls = [...new Set([...(pl.map ? [bare(pl.map.url)] : []), ...pl.segments.map((s) => bare(s.url))])];
+  return {
+    duration: pl.duration,
+    segments: pl.segments.length,
+    live: !pl.endList,
+    encryption: pl.encryption,
+    segmentUrls: segmentUrls.slice(0, MAX_SEGMENT_URLS),
+  };
 }
 
 function dashInfo(text, url) {
-  const { live, drm, duration, reps } = parseMpd(text, url);
-  return { live, drm, duration, reps };
+  const mpd = parseMpd(text, url);
+  const segmentUrls = new Set();
+  for (const r of mpd.reps) {
+    if (mpd.live || segmentUrls.size >= MAX_SEGMENT_URLS) break;
+    const { init, segments } = mpd.segmentsFor(r.id);
+    for (const s of [...(init ? [init] : []), ...segments]) segmentUrls.add(bare(s.url));
+  }
+  const { live, drm, duration, reps } = mpd;
+  return { live, drm, duration, reps, segmentUrls: [...segmentUrls].slice(0, MAX_SEGMENT_URLS) };
 }
 
 async function probe(tabId, item) {

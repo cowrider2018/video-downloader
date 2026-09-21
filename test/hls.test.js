@@ -4,6 +4,7 @@ import { audioFor, ivFor, parsePlaylist, variantLabel } from '../lib/hls.js';
 
 const MASTER = `#EXTM3U
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",URI="subs/en.m3u8"
 #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="aud"
 360/index.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=5000000,AVERAGE-BANDWIDTH=4500000,RESOLUTION=1920x1080,AUDIO="aud"
@@ -26,6 +27,7 @@ test('master playlist: variants sorted best first with absolute URLs', () => {
   assert.deepEqual(pl.variants.map(variantLabel), ['1080p', '360p', '64k']);
   assert.equal(audioFor(pl.variants[0], pl.audio).url, 'https://site.example.com/hls/audio/en.m3u8');
   assert.equal(audioFor(pl.variants[2], pl.audio), null);
+  assert.deepEqual(pl.subtitles, ['https://site.example.com/hls/subs/en.m3u8']);
 });
 
 const MEDIA = `#EXTM3U
