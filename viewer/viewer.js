@@ -99,9 +99,8 @@ function makeRenderer(list, emptyText) {
     });
   }
 
-  // `pinned` rows always show first; the empty text stands for "nothing else".
-  return (specs, pinned = []) => {
-    const items = [...pinned, ...specs].map((r) => {
+  return (specs) => {
+    const items = specs.map((r) => {
       const el = rowEl(r.key);
       el.name.textContent = r.name;
       el.name.title = r.title || r.name;
@@ -110,7 +109,7 @@ function makeRenderer(list, emptyText) {
       setButtons(el, r.buttons);
       return el.li;
     });
-    const keys = new Set([...pinned, ...specs].map((r) => r.key));
+    const keys = new Set(specs.map((r) => r.key));
     for (const key of rows.keys()) if (!keys.has(key)) rows.delete(key);
     const next = specs.length || !emptyText ? items : [...items, empty];
     const same = next.length === list.children.length && next.every((li, i) => list.children[i] === li);
@@ -279,14 +278,6 @@ function imageRows(images) {
 }
 
 const renderMediaRows = makeRenderer(mediaList, '尚未偵測到媒體');
-// Automatic mode: the fastest method that works (the best stream or file the network showed,
-// else a capture of the page's player), chosen when the button is pressed.
-function autoRow() {
-  const key = `auto:${page.url}`;
-  const start = () => send({ type: 'download-auto', tabId: tab.id, title: titleForFiles() });
-  return { key, name: titleForFiles(), title: page.url, meta: ['自動'], buttons: [queueButton(key, start)] };
-}
-
 function renderMedia() {
   const shown = media.filter((m) => !m.parent);
   const rows = [];
@@ -304,7 +295,7 @@ function renderMedia() {
   }
   const images = shown.filter((m) => m.kind === 'image');
   if (images.length) rows.push(...imageRows(images));
-  renderMediaRows(rows, page.url ? [autoRow()] : []);
+  renderMediaRows(rows);
 }
 
 // ---- Download queue -------------------------------------------------------------------
@@ -336,9 +327,7 @@ function jobRow(j) {
   const act = (type) => () => send({ type, id: j.id });
   const unfinished = ['queued', 'running', 'paused', 'saving'].includes(j.status);
   const remove = { text: '×', title: unfinished ? '取消並刪除' : '從清單移除', onClick: act('delete-job') };
-  // Hovering the name shows the source and, for an automatic job, why earlier methods failed.
-  const title = [j.url, ...(j.tried || [])].filter(Boolean).join(' | ');
-  const spec = { key: j.id, name: j.filename, title, meta: [], buttons: [] };
+  const spec = { key: j.id, name: j.filename, title: j.url, meta: [], buttons: [] };
   switch (j.status) {
     case 'running':
       spec.meta = [progressText(j)];
@@ -369,7 +358,6 @@ function jobRow(j) {
       spec.meta = ['已取消'];
       spec.buttons = [remove];
   }
-  if (j.method) spec.meta.unshift(`自動（${j.method}）`);
   return spec;
 }
 
