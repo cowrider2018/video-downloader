@@ -868,8 +868,9 @@ chrome.webRequest.onErrorOccurred.addListener((d) => sentHeaders.delete(d.reques
 chrome.webRequest.onHeadersReceived.addListener(
   (d) => {
     const sent = sentHeaders.get(d.requestId);
-    // Keep the entry across redirects; the next hop's headers replace it.
-    if (d.statusCode < 300 || d.statusCode >= 400) sentHeaders.delete(d.requestId);
+    // Keep the entry across redirects; the next hop's headers replace it. (304 ends the request.)
+    const redirect = d.statusCode >= 300 && d.statusCode < 400 && d.statusCode !== 304;
+    if (!redirect) sentHeaders.delete(d.requestId);
     if (d.tabId < 0 || d.statusCode < 200 || d.statusCode >= 300) return;
     const headers = {};
     for (const { name, value } of d.responseHeaders || []) headers[name.toLowerCase()] = value;
