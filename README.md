@@ -1,6 +1,6 @@
 # Video Downloader
 
-Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊與 HLS／DASH 串流並下載。功能參考 Video DownloadHelper 與貓抓（cat-catch）。
+Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊、HLS／DASH 串流與圖片並下載。功能參考 Video DownloadHelper 與貓抓（cat-catch）。
 
 ## 使用方式
 
@@ -9,6 +9,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 1. **網址列**：貼上網址按 Enter。開啟時會自動載入目前分頁的網址，站內換頁時會跟著更新。
 2. **網頁**：網站直接嵌在小視窗裡執行，不需要另開一般分頁。
 3. **媒體清單**：最上方固定一列「自動」（見下方）；其下一列一個可下載的項目，右側按鈕加入下載。HLS／DASH 的每種畫質各佔一列；DASH 的音軌也各自一列。
+   - 圖片收合成最後一列「圖片（N 張）」：「全部下載」把所有圖片存進以網頁標題命名的資料夾，「展開」逐張列出（格式、尺寸、大小），可單獨下載。
 4. **下載中**：所有加入的下載排在這裡，各自顯示進度。
    - 「暫停」保留已下載的部分，之後按「繼續」接著下載。
    - 「×」取消並從清單刪除；已完成的項目只移除清單，檔案保留在磁碟上。
@@ -23,9 +24,10 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 | 一般影音檔（mp4、webm、mp3…） | 網路回應的 `video/*`、`audio/*` 或副檔名；頁面中的 `<video>`／`<audio>` | 原檔 |
 | HLS（`.m3u8`） | 副檔名或 `mpegurl` MIME | 單一 `.ts`；fMP4 串流為 `.mp4`。支援 AES-128 解密與 byte-range |
 | DASH（`.mpd`） | 副檔名或 `application/dash+xml` | 每個 representation 一個檔案（`.mp4`／`.webm`／`.m4a`）。支援 SegmentTemplate（`$Number$`／`$Time$`、SegmentTimeline）、SegmentList、SegmentBase |
+| 圖片（jpg、png、gif、webp、avif、bmp） | 網路回應的 `image/*` 或副檔名；頁面中的 `<img>`（含延遲載入、`srcset`） | 原檔，存在「網頁標題／原檔名」 |
 | MSE 緩存（`blob:` 播放的影片） | 小視窗開著時，攔截播放器餵給 MediaSource 的資料；一個播放器一列 | fMP4 影像＋音訊合併為單一 `.mp4`（含總長度與索引，可拖曳）；WebM 等其他組合為各軌一個檔案 |
 
-串流片段（`.ts`、`.m4s`）與小於 512 KB 的檔案（多半是預覽或廣告）不會列出。
+串流片段（`.ts`、`.m4s`）與小於 512 KB 的影音檔（多半是預覽或廣告）不會列出。圖片則略過小於 10 KB 或任一邊小於 100 像素的（圖示、按鈕、追蹤像素）與 SVG；每頁最多列 500 張。
 
 ## 自動模式
 
@@ -53,6 +55,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 - 小視窗內嵌的網站被 Chrome 視為第一方，Cookie 照常運作；只對小視窗內的框架移除 `X-Frame-Options` 與 `Content-Security-Policy`，讓網站可以被內嵌。
 - 記錄網頁對每個主機送出的請求標頭；加入下載時存成快照，由背景下載器以 `declarativeNetRequest` 原樣帶上，所以之後換頁也不影響。
 - 播放清單的解析由網頁本身的 content script 以網頁身分進行。
+- 「全部下載」的圖片由背景以網頁身分抓取（沒有記錄到標頭的主機至少帶上網頁的 Referer，防盜連的圖床因此可用），個別失敗的圖片不影響其他張，完成後顯示失敗張數。
 - 一般檔案先交給 Chrome 下載（直接寫入磁碟，帶 Cookie 與自訂標頭）；Chrome 下載無法帶 Referer，若伺服器因此拒絕，會自動改由背景以網頁身分重抓，並支援以 Range 從中斷處續傳。
 
 ## 安裝
@@ -69,6 +72,7 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 - HLS／DASH 合併與背景重抓都在記憶體中進行，非常大的影片會佔用相當記憶體。
 - MSE 緩存捕捉會重新載入一次網頁，需要播放器在載入後能自動開始（會嘗試靜音播放第一個影片）；畫質取決於播放器當時的選擇。關閉小視窗會中斷進行中的捕捉。第一次存多個檔案時，Chrome 可能會詢問是否允許此網站下載多個檔案。
 - 小視窗最小化或完全被遮住時，Chrome 可能延後網頁內的媒體載入，MSE 捕捉會停住，恢復顯示後繼續。
+- 圖片只抓 `<img>` 與網路上的圖片回應；CSS 背景圖若沒有經過網路（已快取）則不會列出，`<canvas>` 繪出的圖片不支援。頁面剛載入時就抵達的圖片，大小可能要等頁面回報後才知道，清單會顯示「至少」。
 - 少數網站會以程式偵測自己被內嵌而拒絕運作（例如部分登入或機器人驗證頁），這類網站無法在小視窗中使用。
 
 ## 架構
@@ -76,13 +80,13 @@ Chrome 擴充功能（Manifest V3）：偵測網頁中播放的影片、音訊�
 | 檔案 | 角色 |
 | --- | --- |
 | `background.js` | Service worker：開啟小視窗與框架標頭規則、偵測媒體、記錄請求身分、播放清單解析預覽、下載佇列（`storage.session`）與身分規則 |
-| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源與頁面標題；轉接 MSE 攔截腳本並組成捕捉的檔案；以網頁身分抓取播放清單 |
+| `content.js` | 回報頁面中的 `<video>`／`<audio>` 來源、`<img>` 圖片（含尺寸）與頁面標題；轉接 MSE 攔截腳本並組成捕捉的檔案；以網頁身分抓取播放清單 |
 | `inject/mse-hook.js` | 在頁面環境中攔截 `addSourceBuffer`／`appendBuffer` 保存緩衝資料，並驅動播放器加速緩衝 |
-| `offscreen/` | 背景下載器：以網頁身分抓取整檔、HLS 或 DASH 片段，可暫停，組成 Blob 後交給 Chrome 存檔 |
+| `offscreen/` | 背景下載器：以網頁身分抓取整檔、一批圖片、HLS 或 DASH 片段，可暫停，組成 Blob 後交給 Chrome 存檔 |
 | `viewer/` | 小視窗：網址列、內嵌網頁、媒體清單與下載中佇列；為每個捕捉開幕後框架 |
-| `lib/media.js` | 媒體分類、大小、檔名 |
+| `lib/media.js` | 媒體與圖片分類、大小、檔名 |
 | `lib/hls.js`、`lib/dash.js` | m3u8 與 MPD 解析（`dash.js` 內含精簡 XML 解析器，因為 service worker 沒有 `DOMParser`） |
-| `lib/jobs.js` | 下載流程：整檔（可續傳）、平行分段下載、暫停閘門、HLS 與 DASH 工作 |
+| `lib/jobs.js` | 下載流程：整檔（可續傳）、平行分段下載、多檔各自下載（單檔失敗不中斷）、暫停閘門、HLS 與 DASH 工作 |
 | `lib/headers.js` | 身分標頭的擷取與過濾 |
 | `lib/fragments.js` | MSE 捕捉的重組：解析 fMP4／WebM 片段，排序、去重、跨畫質拼接、補上總長度；fMP4 影像＋音訊合併與索引 |
 

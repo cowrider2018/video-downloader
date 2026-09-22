@@ -1,5 +1,5 @@
 // Runs in every page and frame from document_start. It:
-//  1. reports <video>/<audio> sources (covers media served from cache);
+//  1. reports <video>/<audio> sources and <img> images (covers media served from cache);
 //  2. bridges inject/mse-hook.js, which lives in the page's world, and assembles its captures;
 //  3. fetches playlists for probing *as the page*: same origin, cookies and referer as the
 //     player's own requests, so sites that check who is asking still answer;
@@ -44,6 +44,36 @@
   );
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scan);
   else scan();
+
+  // ---- DOM images -----------------------------------------------------------------------
+  // Covers images served from cache, which the network never shows, and tells how large
+  // each one is. Smaller than this on either side: icons, avatars, buttons.
+  const MIN_IMAGE_SIDE = 100;
+  const seenImages = new Set();
+
+  function reportImages(imgs) {
+    const fresh = [];
+    for (const img of imgs) {
+      const url = img.currentSrc || img.src;
+      if (!url || !/^https?:/i.test(url) || seenImages.has(url) || !img.complete) continue;
+      if (img.naturalWidth < MIN_IMAGE_SIDE || img.naturalHeight < MIN_IMAGE_SIDE) continue;
+      seenImages.add(url);
+      fresh.push({ url, width: img.naturalWidth, height: img.naturalHeight });
+    }
+    if (fresh.length) send({ type: 'dom-images', images: fresh });
+  }
+
+  // Load events do not bubble either; lazy-loaded and srcset-switched images arrive this way.
+  document.addEventListener(
+    'load',
+    (e) => {
+      if (e.target instanceof HTMLImageElement) reportImages([e.target]);
+    },
+    true,
+  );
+  const scanImages = () => reportImages(document.images);
+  if (document.readyState === 'complete') scanImages();
+  else window.addEventListener('load', scanImages);
 
   // ---- MSE hook bridge ------------------------------------------------------------------
 

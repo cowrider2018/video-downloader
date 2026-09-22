@@ -1,6 +1,6 @@
 import { repLabel } from '../lib/dash.js';
 import { audioFor, variantLabel } from '../lib/hls.js';
-import { displayName, filenameFor, formatBytes } from '../lib/media.js';
+import { displayName, filenameFor, formatBytes, imageFilename } from '../lib/media.js';
 
 const tab = await chrome.tabs.getCurrent();
 const mediaKey = `tab:${tab.id}`;
@@ -17,6 +17,7 @@ let page = {}; // { url, title } of the framed page
 let media = [];
 let jobs = [];
 let editing = false; // the user is typing; don't overwrite the address bar
+let imagesOpen = false; // the image rows are shown, not just their summary row
 
 // ---- Address bar ----------------------------------------------------------------------
 
@@ -141,7 +142,7 @@ function formatDuration(sec) {
 // A row's button says "已加入" for a moment after it queued something.
 const queuedAt = new Map();
 
-function queueButton(key, start) {
+function queueButton(key, start, text = '下載') {
   const left = 1500 - (Date.now() - (queuedAt.get(key) || 0));
   if (left > 0) {
     // Whichever render shows the notice also takes it down; a row rebuilt later (after
@@ -150,7 +151,7 @@ function queueButton(key, start) {
     return { text: '已加入', disabled: true };
   }
   return {
-    text: '下載',
+    text,
     onClick: async () => {
       queuedAt.set(key, Date.now());
       renderMedia();
@@ -240,6 +241,43 @@ function rowsFor(m) {
   return [row(m.url, meta, queueButton(m.url, () => startHls(m, m.url, '', null)))];
 }
 
+// Images: a page can show hundreds, so they fold into one row that downloads them all, and
+// open into one row each.
+function imageRows(images) {
+  const known = images.filter((m) => m.size != null);
+  const total = known.reduce((n, m) => n + m.size, 0);
+  const summary = {
+    key: 'images',
+    name: `圖片（${images.length} 張）`,
+    meta: [known.length ? `${known.length === images.length ? '' : '至少 '}${formatBytes(total)}` : ''],
+    buttons: [
+      {
+        text: imagesOpen ? '收合' : '展開',
+        onClick: () => {
+          imagesOpen = !imagesOpen;
+          renderMedia();
+        },
+      },
+      queueButton(`images:${page.url}`, () => send({ type: 'download-images', tabId: tab.id, title: titleForFiles() }), '全部下載'),
+    ],
+  };
+  if (!imagesOpen) return [summary];
+  return [
+    summary,
+    ...images.map((m) => ({
+      key: m.url,
+      name: displayName(m.url),
+      title: m.url,
+      meta: [m.ext.toUpperCase(), m.width ? `${m.width}×${m.height}` : '', formatBytes(m.size)],
+      buttons: [
+        queueButton(m.url, () =>
+          send({ type: 'download', tabId: tab.id, mediaId: m.id, filename: imageFilename(titleForFiles(), m.url, m.ext) }),
+        ),
+      ],
+    })),
+  ];
+}
+
 const renderMediaRows = makeRenderer(mediaList, '尚未偵測到媒體');
 // Automatic mode: the fastest method that works (the best stream or file the network showed,
 // else a capture of the page's player), chosen when the button is pressed.
@@ -254,6 +292,7 @@ function renderMedia() {
   const rows = [];
   const players = new Set();
   for (const m of shown) {
+    if (m.kind === 'image') continue;
     if (m.kind !== 'mse') {
       rows.push(...rowsFor(m));
       continue;
@@ -263,6 +302,8 @@ function renderMedia() {
     players.add(player);
     rows.push(mseRow(shown.filter((x) => x.kind === 'mse' && `${x.frameId}:${x.source}` === player)));
   }
+  const images = shown.filter((m) => m.kind === 'image');
+  if (images.length) rows.push(...imageRows(images));
   renderMediaRows(rows, page.url ? [autoRow()] : []);
 }
 
@@ -283,6 +324,7 @@ function progressText(j) {
     if (!p) return '下載中';
     return p.total > 0 ? `${Math.floor((p.bytes / p.total) * 100)}% · ${formatBytes(p.total)}` : formatBytes(p.bytes);
   }
+  if (j.kind === 'images') return j.total ? `${j.done}/${j.total} 張 · ${formatBytes(j.bytes)}` : '準備中';
   if (!j.total) return j.bytes ? formatBytes(j.bytes) : '準備中';
   const pct = `${Math.floor((j.done / j.total) * 100)}%`;
   return j.kind === 'hls' ? `${pct} · ${j.done}/${j.total} 片段` : `${pct} · ${formatBytes(j.total)}`;
@@ -315,7 +357,7 @@ function jobRow(j) {
       spec.buttons = [remove];
       break;
     case 'done':
-      spec.meta = ['完成', formatBytes(j.bytes || nativeProgress.get(j.downloadId)?.total)];
+      spec.meta = ['完成', formatBytes(j.bytes || nativeProgress.get(j.downloadId)?.total), j.failedCount ? `${j.failedCount} 張失敗` : ''];
       spec.buttons = [{ text: '顯示', onClick: () => chrome.downloads.show(j.downloadId) }, remove];
       break;
     case 'failed':

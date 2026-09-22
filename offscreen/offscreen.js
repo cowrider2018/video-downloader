@@ -2,9 +2,9 @@
 // carry the page's identity through header rules the service worker installs per host
 // (see installIdentity); the finished blob: URL goes back to the worker, which cannot
 // create blob URLs itself.
-import { fetchFile, makeFetchBytes, makeGate, runDashJob, runHlsJob } from '../lib/jobs.js';
+import { fetchEach, fetchFile, makeFetchBytes, makeGate, runDashJob, runHlsJob } from '../lib/jobs.js';
 
-const running = new Map(); // job id -> { controller, gate, cancelled, blobUrl }
+const running = new Map(); // job id -> { controller, gate, cancelled, blobUrls }
 
 const post = (msg) => chrome.runtime.sendMessage({ target: 'background', ...msg }).catch(() => {});
 
@@ -23,13 +23,13 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'resume') running.get(msg.id)?.gate.resume();
   if (msg.type === 'release') {
     const r = running.get(msg.id);
-    if (r?.blobUrl) URL.revokeObjectURL(r.blobUrl);
+    r?.blobUrls.forEach((u) => URL.revokeObjectURL(u));
     running.delete(msg.id);
   }
 });
 
 async function run(job) {
-  const state = { controller: new AbortController(), gate: makeGate(), cancelled: false, blobUrl: null };
+  const state = { controller: new AbortController(), gate: makeGate(), cancelled: false, blobUrls: [] };
   running.set(job.id, state);
   const { signal } = state.controller;
   const { gate } = state;
@@ -57,6 +57,20 @@ async function run(job) {
   };
 
   try {
+    if (job.kind === 'images') {
+      await beforeFetch(job.files.map((f) => f.url));
+      const results = await fetchEach(job.files.map((f) => f.url), { fetchImpl, signal, onProgress, gate });
+      const files = [];
+      results.forEach((r, i) => {
+        if (r instanceof Error) return;
+        const blobUrl = URL.createObjectURL(r);
+        state.blobUrls.push(blobUrl);
+        files.push({ blobUrl, filename: job.files[i].filename, size: r.size });
+      });
+      if (!files.length) throw results[0];
+      post({ type: 'job-ready', id: job.id, files, failed: results.length - files.length });
+      return;
+    }
     let blob;
     let ext = job.ext;
     if (job.kind === 'file') {
@@ -68,8 +82,9 @@ async function run(job) {
       ({ blob, ext } =
         job.kind === 'dash' ? await runDashJob(job.url, job.repId, options) : await runHlsJob(job.url, options));
     }
-    state.blobUrl = URL.createObjectURL(blob);
-    post({ type: 'job-ready', id: job.id, blobUrl: state.blobUrl, ext, size: blob.size });
+    const blobUrl = URL.createObjectURL(blob);
+    state.blobUrls.push(blobUrl);
+    post({ type: 'job-ready', id: job.id, blobUrl, ext, size: blob.size });
   } catch (e) {
     state.controller.abort();
     running.delete(job.id);

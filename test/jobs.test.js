@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createCipheriv, randomBytes } from 'node:crypto';
 import { test } from 'node:test';
-import { runHlsJob } from '../lib/jobs.js';
+import { fetchEach, runHlsJob } from '../lib/jobs.js';
 
 const BASE = 'https://cdn.example.com/v/';
 
@@ -64,4 +64,16 @@ test('stops when aborted', async () => {
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(runHlsJob(`${BASE}media.m3u8`, { fetchBytes, signal: controller.signal }), /已取消/);
+});
+
+test('fetchEach keeps going past a failed file and reports every result in order', async () => {
+  const fetchImpl = async (url) =>
+    url.endsWith('bad.jpg') ? new Response('no', { status: 403 }) : new Response(new Uint8Array(url.length), { status: 200 });
+  const urls = ['https://a.com/1.jpg', 'https://a.com/bad.jpg', 'https://a.com/33.jpg'];
+  const seen = [];
+  const results = await fetchEach(urls, { fetchImpl, onProgress: (p) => seen.push(p.done) });
+  assert.equal(results[0].size, urls[0].length);
+  assert.ok(results[1] instanceof Error);
+  assert.equal(results[2].size, urls[2].length);
+  assert.equal(seen.at(-1), 3);
 });

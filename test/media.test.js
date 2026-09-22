@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { classify, filenameFor, formatBytes, sizeFromHeaders } from '../lib/media.js';
+import { classify, filenameFor, formatBytes, imageFilename, sizeFromHeaders } from '../lib/media.js';
 
 const MB = 1024 * 1024;
 
@@ -26,6 +26,22 @@ test('classify rejects segments, small files and non-media', () => {
   assert.equal(classify('https://a.com/preview.mp4', 'video/mp4', 20_000), null);
   assert.equal(classify('https://a.com/page.html', 'text/html', 5 * MB), null);
   assert.equal(classify('blob:https://a.com/uuid', 'video/mp4', null), null);
+});
+
+test('classify detects images by mime or extension, skipping small ones', () => {
+  assert.deepEqual(classify('https://a.com/p/photo.jpeg?w=1200', 'image/jpeg', 300_000), { kind: 'image', ext: 'jpg' });
+  assert.deepEqual(classify('https://a.com/img/123', 'image/webp', 80_000), { kind: 'image', ext: 'webp' });
+  assert.deepEqual(classify('https://a.com/a.png', 'application/octet-stream', 50_000), { kind: 'image', ext: 'png' });
+  assert.deepEqual(classify('https://a.com/a.gif', '', null), { kind: 'image', ext: 'gif' });
+  assert.equal(classify('https://a.com/icon.png', 'image/png', 900), null);
+  assert.equal(classify('https://a.com/logo.svg', 'image/svg+xml', 50_000), null);
+  assert.equal(classify('https://a.com/page.jpg', 'text/html', 50_000), null);
+});
+
+test('imageFilename keeps the image name inside a folder named after the page', () => {
+  assert.equal(imageFilename('Gallery: day 1', 'https://a.com/p/IMG_0012.jpeg?x=1', 'jpg'), 'Gallery day 1/IMG_0012.jpg');
+  assert.equal(imageFilename('', 'https://a.com/', 'png'), 'images/a.com.png');
+  assert.equal(imageFilename('T', 'https://a.com/img/%E7%8C%AB', 'webp'), 'T/猫.webp');
 });
 
 test('sizeFromHeaders prefers the total from Content-Range', () => {

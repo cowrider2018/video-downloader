@@ -1,7 +1,7 @@
 import { identityHeaders, pageHeaders } from './lib/headers.js';
 import { parseMpd, repExt, repLabel } from './lib/dash.js';
 import { audioFor, parsePlaylist, variantLabel } from './lib/hls.js';
-import { classify, filenameFor, sizeFromHeaders, urlExt } from './lib/media.js';
+import { classify, filenameFor, imageFilename, sizeFromHeaders, urlExt } from './lib/media.js';
 
 // Everything lives in storage.session because the service worker can be torn down at any
 // moment and in-memory state would be lost with it:
@@ -72,11 +72,15 @@ function linkChildren(list) {
 // Enough segment URLs to recognise a playlist's segments, without filling up storage.
 const MAX_SEGMENT_URLS = 3000;
 
+// An endless feed keeps loading images; past this many a page's list stops taking more.
+const MAX_IMAGES = 500;
+
 async function addMedia(tabId, item) {
   let added = null;
   await update(tabKey(tabId), (list = []) => {
     const old = list.find((m) => m.url === item.url);
     if (!old) {
+      if (item.kind === 'image' && list.filter((m) => m.kind === 'image').length >= MAX_IMAGES) return undefined;
       added = { id: crypto.randomUUID(), detectedAt: Date.now(), ...item };
       return linkChildren([...list, added]);
     }
@@ -84,7 +88,9 @@ async function addMedia(tabId, item) {
     // request headers that a DOM sighting of the same URL lacks.
     const grew = item.kind === 'mse' ? old.size !== item.size || old.truncated !== item.truncated : false;
     const learned = !old.headers && item.headers;
-    if (grew || learned || (old.size == null && item.size != null)) {
+    // The page tells an image's dimensions; the network its size and real type.
+    const measured = item.width && !old.width;
+    if (grew || learned || measured || (old.size == null && item.size != null)) {
       return list.map((m) =>
         m === old
           ? {
@@ -93,6 +99,9 @@ async function addMedia(tabId, item) {
               truncated: item.truncated,
               headers: m.headers || item.headers,
               frameId: learned ? item.frameId : m.frameId,
+              width: m.width ?? item.width,
+              height: m.height ?? item.height,
+              ext: m.kind === 'image' && item.size != null ? item.ext : m.ext,
             }
           : m,
       );
@@ -147,7 +156,14 @@ async function snapshotIdentity(tabId, item) {
   if (item.headers) hosts[own] = { ...hosts[own], ...item.headers };
   const fallback = { ...pageHeaders(item.headers) };
   for (const k of ['referer', 'origin']) if (item.headers?.[k]) fallback[k] = item.headers[k];
+  // Images keep no headers of their own; image hosts check the referer, so send the page's.
+  if (item.kind === 'image' && !fallback.referer) fallback.referer = await pageUrlOf(tabId);
   return { hosts, fallback };
+}
+
+async function pageUrlOf(tabId) {
+  const { [pageKey(tabId)]: page = {} } = await chrome.storage.session.get(pageKey(tabId));
+  return page.url || '';
 }
 
 // One session rule per host for requests the extension itself makes (tabId -1).
@@ -343,6 +359,7 @@ async function probe(tabId, item) {
 //           used when the server refuses the native download;
 //   hls     a stream assembled by the offscreen document with the page's identity;
 //   dash    one representation of a DASH stream, likewise;
+//   images  every image of a page, fetched by the offscreen document and saved one by one;
 //   mse     the page's own player buffering the whole video, captured in the page.
 
 const patchJob = (id, patch) =>
@@ -385,6 +402,7 @@ async function runInOffscreen(job, item) {
       kind: job.kind,
       url: job.url,
       repId: job.repId,
+      files: job.files,
       ext: item.ext,
       headers: pageHeaders(item.headers),
     },
@@ -450,6 +468,23 @@ async function startDash({ tabId, mediaId, repId, title, tag }, extra = {}) {
   });
   await runInOffscreen(job, item);
   return job;
+}
+
+// All the images the page has shown, into a folder named after it. One queue row for the lot.
+async function startImages({ tabId, title }) {
+  const { [tabKey(tabId)]: list = [] } = await chrome.storage.session.get(tabKey(tabId));
+  const images = list.filter((m) => m.kind === 'image');
+  if (!images.length) throw new Error('沒有可下載的圖片');
+  const job = await newJob({
+    kind: 'images',
+    tabId,
+    url: await pageUrlOf(tabId),
+    title,
+    filename: `${title}（${images.length} 張圖片）`,
+    files: images.map((m) => ({ url: m.url, filename: imageFilename(title, m.url, m.ext) })),
+    identity: await snapshotIdentity(tabId, images[0]),
+  });
+  await runInOffscreen(job, { headers: {} });
 }
 
 // ---- MSE captures -------------------------------------------------------------------
@@ -651,10 +686,11 @@ async function retryAsPage(job) {
   await runInOffscreen({ ...job, kind: 'file' }, item);
 }
 
-async function onJobReady({ id, blobUrl, ext, size }) {
+async function onJobReady({ id, blobUrl, ext, size, files, failed }) {
   const job = await findJob((j) => j.id === id);
   // Deleted while it was finishing: just let go of the blob.
   if (!job) return void toOffscreen({ type: 'release', id });
+  if (files) return onImagesReady(job, files, failed);
   const filename = job.kind === 'hls' || job.kind === 'dash' ? filenameFor(job.title, ext, job.tag) : job.filename;
   await patchJob(id, { status: 'saving', filename, bytes: size, done: job.total || size, total: job.total || size });
   try {
@@ -664,6 +700,43 @@ async function onJobReady({ id, blobUrl, ext, size }) {
     await patchJob(id, { status: 'failed', error: e.message });
     finishJob(job);
   }
+}
+
+// Saves each fetched image; the job is done once every one of those downloads has ended.
+async function onImagesReady(job, files, failed) {
+  await patchJob(job.id, { status: 'saving', bytes: files.reduce((n, f) => n + f.size, 0), failedCount: failed });
+  const ids = [];
+  let refused = 0;
+  for (const f of files) {
+    try {
+      ids.push(await chrome.downloads.download({ url: f.blobUrl, filename: f.filename, conflictAction: 'uniquify' }));
+    } catch {
+      refused++;
+    }
+  }
+  await patchJob(job.id, { downloadIds: ids, downloadId: ids[0] ?? null, failedCount: failed + refused });
+  await settleImages(job.id);
+}
+
+// Finishes an image job once none of its downloads is still in progress.
+async function settleImages(id) {
+  const job = await findJob((j) => j.id === id);
+  if (job?.status !== 'saving' || !job.downloadIds) return;
+  const found = await Promise.all(job.downloadIds.map((d) => chrome.downloads.search({ id: d })));
+  const states = found.map((r) => r[0]?.state);
+  if (states.includes('in_progress')) return;
+  const lost = states.filter((s) => s !== 'complete').length;
+  const saved = states.length - lost;
+  let settled = false;
+  await update(JOBS, (jobs = []) =>
+    jobs.map((j) => {
+      if (j.id !== id || j.status !== 'saving') return j;
+      settled = true;
+      const failedCount = job.failedCount + lost;
+      return saved ? { ...j, status: 'done', failedCount } : { ...j, status: 'failed', error: '圖片都無法存檔', failedCount };
+    }),
+  );
+  if (settled) finishJob(job);
 }
 
 // Drops the job's header rules and blob; closes the offscreen document when idle.
@@ -677,7 +750,7 @@ async function finishJob(job) {
     toOffscreen({ type: 'release', id: job.id });
   }
   const { [JOBS]: jobs = [] } = await chrome.storage.session.get(JOBS);
-  const busy = jobs.some((j) => ['file', 'hls', 'dash'].includes(j.kind) && ['running', 'paused', 'saving'].includes(j.status));
+  const busy = jobs.some((j) => ['file', 'hls', 'dash', 'images'].includes(j.kind) && ['running', 'paused', 'saving'].includes(j.status));
   if (!busy) chrome.offscreen.closeDocument().catch(() => {});
 }
 
@@ -730,9 +803,9 @@ async function deleteJob(id) {
   await update(JOBS, (jobs = []) => jobs.filter((j) => j.id !== id));
   const unfinished = ['running', 'paused', 'saving'].includes(job.status);
   if (!unfinished) return;
-  if (job.downloadId != null) {
-    await chrome.downloads.cancel(job.downloadId).catch(() => {});
-    chrome.downloads.erase({ id: job.downloadId }).catch(() => {});
+  for (const d of job.downloadIds || (job.downloadId != null ? [job.downloadId] : [])) {
+    await chrome.downloads.cancel(d).catch(() => {});
+    chrome.downloads.erase({ id: d }).catch(() => {});
   }
   if (job.kind === 'mse') {
     toPage(job, { type: 'mse-cancel' });
@@ -746,13 +819,16 @@ async function deleteJob(id) {
 chrome.downloads.onChanged.addListener(async (delta) => {
   const state = delta.state?.current;
   if (state !== 'complete' && state !== 'interrupted') return;
-  let job = await findJob((j) => j.downloadId === delta.id);
+  const owns = (j) => j.downloadId === delta.id || j.downloadIds?.includes(delta.id);
+  let job = await findJob(owns);
   // A fast refusal can arrive before downloadFile() has stored the download id.
   if (!job && state === 'interrupted') {
     await sleep(300);
-    job = await findJob((j) => j.downloadId === delta.id);
+    job = await findJob(owns);
   }
   if (!job || job.status === 'cancelled') return;
+  // An image that failed to save is counted, not a reason to stop the rest.
+  if (job.kind === 'images') return void settleImages(job.id);
   if (state === 'complete') {
     await patchJob(job.id, { status: 'done' });
   } else if (job.kind === 'native' && /^SERVER_/.test(delta.error?.current || '')) {
@@ -770,7 +846,7 @@ chrome.downloads.onChanged.addListener(async (delta) => {
 
 chrome.action.onClicked.addListener(openViewer);
 
-const MEDIA_FILTER = { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'object', 'other'] };
+const MEDIA_FILTER = { urls: ['http://*/*', 'https://*/*'], types: ['media', 'image', 'xmlhttprequest', 'object', 'other'] };
 
 // What the page sent for each in-flight request, kept until its response arrives.
 // extraHeaders is needed to see Cookie and Referer.
@@ -801,7 +877,9 @@ chrome.webRequest.onHeadersReceived.addListener(
     const hit = classify(d.url, headers['content-type'], size);
     if (!hit) return;
     inOrder(d.tabId, async () => {
-      if (!(await isCaptureFrame(d.tabId, d.frameId))) await addMedia(d.tabId, { url: d.url, ...hit, size, headers: sent, frameId: d.frameId });
+      if (await isCaptureFrame(d.tabId, d.frameId)) return;
+      // Images keep no headers: there can be hundreds, and the tab's identity has their hosts.
+      await addMedia(d.tabId, { url: d.url, ...hit, size, headers: hit.kind === 'image' ? undefined : sent, frameId: d.frameId });
     });
   },
   MEDIA_FILTER,
@@ -836,6 +914,17 @@ async function addDomMedia(tabId, frameId, urls) {
     // A <video src> without a recognizable extension is still a video.
     const hit = classify(url, '', null) ?? (urlExt(url) ? null : { kind: 'file', ext: 'mp4' });
     if (hit) await addMedia(tabId, { url, ...hit, size: null, frameId });
+  }
+}
+
+// <img> images the content script found, with their dimensions. The page says it is an image
+// whatever the URL looks like; only the type is a guess until the network shows it.
+async function addDomImages(tabId, frameId, images) {
+  for (const { url, width, height } of images) {
+    if (urlExt(url) === 'svg') continue;
+    const hit = classify(url, '', null);
+    const ext = hit?.kind === 'image' ? hit.ext : 'jpg';
+    await addMedia(tabId, { url, kind: 'image', ext, size: null, width, height, frameId });
   }
 }
 
@@ -884,6 +973,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return;
     }
     case 'dom-media':
+    case 'dom-images':
     case 'mse-streams': {
       const tabId = sender.tab?.id;
       if (tabId == null) return;
@@ -891,6 +981,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       inOrder(tabId, async () => {
         if (await isCaptureFrame(tabId, sender.frameId)) return;
         if (msg.type === 'dom-media') await addDomMedia(tabId, sender.frameId, msg.urls);
+        else if (msg.type === 'dom-images') await addDomImages(tabId, sender.frameId, msg.images);
         else await addPlayers(tabId, sender.frameId, msg.streams);
       });
       return;
@@ -906,6 +997,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return true;
     case 'download':
       downloadFile(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
+      return true;
+    case 'download-images':
+      startImages(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
       return true;
     case 'download-dash':
       startDash(msg).then(() => reply({ ok: true }), (e) => reply({ error: e.message }));
