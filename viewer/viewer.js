@@ -17,7 +17,8 @@ let page = {}; // { url, title } of the framed page
 let media = [];
 let jobs = [];
 let editing = false; // the user is typing; don't overwrite the address bar
-let imagesOpen = false; // the image rows are shown, not just their summary row
+// Groups of rows (videos, captures, images) that are open, not folded into their summary row.
+const open = new Set();
 
 // ---- Address bar ----------------------------------------------------------------------
 
@@ -245,30 +246,29 @@ function rowsFor(m) {
   return [row(m.url, meta, queueButton(m.url, () => startHls(m, m.url, '', null)))];
 }
 
+// A group folds into one summary row, and opens into its rows; folded by default.
+function fold(key, name, meta, rows, extra = []) {
+  const toggle = {
+    text: open.has(key) ? '收合' : '展開',
+    onClick: () => {
+      open.has(key) ? open.delete(key) : open.add(key);
+      renderMedia();
+    },
+  };
+  const summary = { key, name, meta, buttons: [toggle, ...extra] };
+  return open.has(key) ? [summary, ...rows] : [summary];
+}
+
 // Images: a page can show hundreds, so they fold into one row that downloads them all, and
 // open into one row each.
 function imageRows(images) {
   const known = images.filter((m) => m.size != null);
   const total = known.reduce((n, m) => n + m.size, 0);
-  const summary = {
-    key: 'images',
-    name: `圖片（${images.length} 張）`,
-    meta: [known.length ? `${known.length === images.length ? '' : '至少 '}${formatBytes(total)}` : ''],
-    buttons: [
-      {
-        text: imagesOpen ? '收合' : '展開',
-        onClick: () => {
-          imagesOpen = !imagesOpen;
-          renderMedia();
-        },
-      },
-      queueButton(`images:${page.url}`, () => send({ type: 'download-images', tabId: tab.id, title: titleForFiles() }), '全部下載'),
-    ],
-  };
-  if (!imagesOpen) return [summary];
-  return [
-    summary,
-    ...images.map((m) => ({
+  return fold(
+    'images',
+    `圖片（${images.length} 張）`,
+    [known.length ? `${known.length === images.length ? '' : '至少 '}${formatBytes(total)}` : ''],
+    images.map((m) => ({
       key: m.url,
       name: displayName(m.url),
       title: m.url,
@@ -279,28 +279,29 @@ function imageRows(images) {
         ),
       ],
     })),
-  ];
+    [queueButton(`images:${page.url}`, () => send({ type: 'download-images', tabId: tab.id, title: titleForFiles() }), '全部下載')],
+  );
 }
 
 const renderMediaRows = makeRenderer(mediaList, '尚未偵測到媒體');
 function renderMedia() {
   const shown = media.filter((m) => !m.parent);
-  const rows = [];
-  const players = new Set();
+  // Files and streams: several fold into 影音（N 個）, like the captures and the images.
+  const videos = shown.filter((m) => m.kind !== 'mse' && m.kind !== 'image');
+  const videoRows = videos.flatMap(rowsFor);
+  const players = new Map(); // player -> its tracks
   for (const m of shown) {
-    if (m.kind === 'image') continue;
-    if (m.kind !== 'mse') {
-      rows.push(...rowsFor(m));
-      continue;
-    }
+    if (m.kind !== 'mse') continue;
     const player = `${m.frameId}:${m.source}`;
-    if (players.has(player)) continue;
-    players.add(player);
-    rows.push(mseRow(shown.filter((x) => x.kind === 'mse' && `${x.frameId}:${x.source}` === player)));
+    players.set(player, [...(players.get(player) || []), m]);
   }
+  const captureRows = [...players.values()].map(mseRow);
   const images = shown.filter((m) => m.kind === 'image');
-  if (images.length) rows.push(...imageRows(images));
-  renderMediaRows(rows);
+  renderMediaRows([
+    ...(videos.length > 1 ? fold('videos', `影音（${videos.length} 個）`, [], videoRows) : videoRows),
+    ...(captureRows.length > 1 ? fold('captures', `緩存（${captureRows.length} 個）`, [], captureRows) : captureRows),
+    ...(images.length ? imageRows(images) : []),
+  ]);
 }
 
 // ---- Download queue -------------------------------------------------------------------
