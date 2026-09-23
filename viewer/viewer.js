@@ -54,6 +54,11 @@ addr.addEventListener('blur', () => {
   if (page.url) addr.value = page.url;
 });
 
+// The framed page's navigations are part of this tab's session history, so the viewer's own
+// history steps through them (a cross-origin frame's history can't be reached directly).
+document.getElementById('back').addEventListener('click', () => history.back());
+document.getElementById('forward').addEventListener('click', () => history.forward());
+
 function applyPage(p = {}) {
   const changed = p.url !== page.url || p.title !== page.title;
   page = p;
